@@ -1,0 +1,2334 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NFW egress-inspection demo (VGW DX peering + local NAT egress). This is a fork of the
+  nfw-vgw-demo template: the original VGW + Site-to-Site VPN + BGP + NFW architecture that
+  simulates a DX-connected IDC (10.0.0.0/16, secondary 10.132.0.0/16) is fully preserved.
+  On top of it, the inspection VPC (10.87.0.0/16) gains its own Internet Gateway and two
+  per-AZ NAT Gateways so cloud workloads can egress to the internet. Egress is steered through
+  NFW BEFORE NAT (firewall-then-NAT) so the firewall sees real workload source IPs. Unlike the
+  VGW demo, the egress inspection route entries are created by this template at deploy time,
+  so NFW starts inspecting outbound internet traffic immediately after the stack completes.
+  The IDC east-west inspection routes remain operator-driven (manual), exactly as in the
+  original demo.
+
+Parameters:
+  KeyPairName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: Existing EC2 key pair for SSH access to all EC2 instances
+
+  LatestUbuntuArmAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/canonical/ubuntu/server/noble/stable/current/arm64/hvm/ebs-gp3/ami-id'
+    Description: Latest Ubuntu 24.04 ARM64 AMI (used for workload EC2 and strongSwan/FRR gateway)
+
+  Tunnel1PreSharedKey:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: '^[A-Za-z0-9._]+$'
+    Default: 'Nfw2026Tunnel1Psk_changeme'
+    Description: Pre-shared key for VPN tunnel 1 (8-64 chars, alnum and . _ only)
+
+  Tunnel2PreSharedKey:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: '^[A-Za-z0-9._]+$'
+    Default: 'Nfw2026Tunnel2Psk_changeme'
+    Description: Pre-shared key for VPN tunnel 2 (8-64 chars, alnum and . _ only)
+
+  CustomerBgpAsn:
+    Type: Number
+    Default: 65000
+    Description: Private BGP ASN used by the simulated on-prem strongSwan/FRR gateway
+
+  AwsVgwBgpAsn:
+    Type: Number
+    Default: 64512
+    Description: BGP ASN advertised by the AWS Virtual Private Gateway
+
+Mappings:
+  Cidr:
+    InspectionVpc:
+      Vpc:                  '10.87.0.0/16'
+      PrivateSubnetAZ1:     '10.87.114.0/24'
+      PrivateSubnetAZ2:     '10.87.113.0/24'
+      FirewallSubnetAZ1:    '10.87.115.0/28'
+      FirewallSubnetAZ2:    '10.87.115.16/28'
+      # NAT (public) subnets hosting the per-AZ NAT Gateways. New in the
+      # nat-egress fork; they do not overlap the existing private/firewall subnets.
+      NatSubnetAZ1:         '10.87.116.0/28'
+      NatSubnetAZ2:         '10.87.116.16/28'
+    OnPremVpc:
+      Vpc:                  '10.0.0.0/16'
+      VpcSecondary:         '10.132.0.0/16'
+      PublicSubnet:         '10.0.1.0/24'
+      PrivateSubnet:        '10.132.66.0/24'
+      BgpAnnounce:          '10.0.0.0/8'
+    Vpn:
+      Tunnel1Inside:        '169.254.100.0/30'
+      Tunnel2Inside:        '169.254.100.4/30'
+
+Resources:
+
+  # ============================================================
+  # Inspection VPC (target of NFW inspection)
+  # ============================================================
+  InspectionVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [Cidr, InspectionVpc, Vpc]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Inspection VPC
+
+  PrivateSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InspectionVPC
+      CidrBlock: !FindInMap [Cidr, InspectionVpc, PrivateSubnetAZ1]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: Private subnet AZ1
+
+  PrivateSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InspectionVPC
+      CidrBlock: !FindInMap [Cidr, InspectionVpc, PrivateSubnetAZ2]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: Private subnet AZ2
+
+  FirewallSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InspectionVPC
+      CidrBlock: !FindInMap [Cidr, InspectionVpc, FirewallSubnetAZ1]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: Firewall subnet AZ1
+
+  FirewallSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InspectionVPC
+      CidrBlock: !FindInMap [Cidr, InspectionVpc, FirewallSubnetAZ2]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: Firewall subnet AZ2
+
+  # ============================================================
+  # Inspection VPC internet egress (NEW in the nat-egress fork)
+  #
+  # Internet Gateway + two per-AZ NAT subnets + two NAT Gateways.
+  # Cloud workloads reach the internet via:
+  #   workload subnet -> NFW endpoint -> NAT Gateway -> IGW
+  # i.e. firewall BEFORE NAT, so NFW logs the real workload source
+  # IP (10.87.114.x / 10.87.113.x) instead of a post-SNAT address.
+  # No inbound-from-internet path is created (no ELB, no EIP on EC2).
+  # ============================================================
+  InspectionIGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Inspection IGW
+
+  InspectionIGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref InspectionVPC
+      InternetGatewayId: !Ref InspectionIGW
+
+  NatSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InspectionVPC
+      CidrBlock: !FindInMap [Cidr, InspectionVpc, NatSubnetAZ1]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: NAT subnet AZ1
+
+  NatSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InspectionVPC
+      CidrBlock: !FindInMap [Cidr, InspectionVpc, NatSubnetAZ2]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: NAT subnet AZ2
+
+  NatEIPAZ1:
+    Type: AWS::EC2::EIP
+    DependsOn: InspectionIGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: NAT GW EIP AZ1
+
+  NatEIPAZ2:
+    Type: AWS::EC2::EIP
+    DependsOn: InspectionIGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: NAT GW EIP AZ2
+
+  NatGatewayAZ1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIPAZ1.AllocationId
+      SubnetId: !Ref NatSubnetAZ1
+      Tags:
+        - Key: Name
+          Value: NAT Gateway AZ1
+
+  NatGatewayAZ2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIPAZ2.AllocationId
+      SubnetId: !Ref NatSubnetAZ2
+      Tags:
+        - Key: Name
+          Value: NAT Gateway AZ2
+
+  # NAT subnet route tables.
+  #  - 0.0.0.0/0 -> IGW (NAT egress to internet)
+  #  - <workload /24> -> NFW endpoint (return traffic from the internet,
+  #    after the NAT Gateway de-SNATs back to the workload private IP, is
+  #    steered back through the firewall so the stateful engine sees both
+  #    directions of the flow). The /24 is more specific than the local
+  #    /16 route, which is what makes the inspection hairpin work.
+  NatRouteTableAZ1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: nat-rt-az1
+
+  NatDefaultRouteAZ1:
+    Type: AWS::EC2::Route
+    DependsOn: InspectionIGWAttachment
+    Properties:
+      RouteTableId: !Ref NatRouteTableAZ1
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InspectionIGW
+
+  NatReturnRouteToNFWAZ1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref NatRouteTableAZ1
+      DestinationCidrBlock: !FindInMap [Cidr, InspectionVpc, PrivateSubnetAZ1]
+      VpcEndpointId: !GetAtt NFWEndpointResolver.EndpointIdAZ1
+
+  NatSubnetRouteTableAssociationAZ1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref NatSubnetAZ1
+      RouteTableId: !Ref NatRouteTableAZ1
+
+  NatRouteTableAZ2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: nat-rt-az2
+
+  NatDefaultRouteAZ2:
+    Type: AWS::EC2::Route
+    DependsOn: InspectionIGWAttachment
+    Properties:
+      RouteTableId: !Ref NatRouteTableAZ2
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InspectionIGW
+
+  NatReturnRouteToNFWAZ2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref NatRouteTableAZ2
+      DestinationCidrBlock: !FindInMap [Cidr, InspectionVpc, PrivateSubnetAZ2]
+      VpcEndpointId: !GetAtt NFWEndpointResolver.EndpointIdAZ2
+
+  NatSubnetRouteTableAssociationAZ2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref NatSubnetAZ2
+      RouteTableId: !Ref NatRouteTableAZ2
+
+  # ============================================================
+  # Virtual Private Gateway + VPN attachment
+  # ============================================================
+  VGW:
+    Type: AWS::EC2::VPNGateway
+    Properties:
+      Type: ipsec.1
+      AmazonSideAsn: !Ref AwsVgwBgpAsn
+      Tags:
+        - Key: Name
+          Value: Inspection VGW
+
+  VGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref InspectionVPC
+      VpnGatewayId: !Ref VGW
+
+
+  # ============================================================
+  # Simulated on-prem VPC (acts as the IDC)
+  # ============================================================
+  OnPremVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [Cidr, OnPremVpc, Vpc]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Simulated OnPrem VPC
+
+  # Secondary CIDR (10.132.0.0/16) hosts the inspected subnet 10.132.66.0/24,
+  # the specific prefix that operators steer through NFW with a static
+  # longest-prefix route. The wider 10.0.0.0/8 is what BGP propagates.
+  OnPremVPCSecondaryCidr:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref OnPremVPC
+      CidrBlock: !FindInMap [Cidr, OnPremVpc, VpcSecondary]
+
+  OnPremIGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: OnPrem IGW
+
+  OnPremIGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref OnPremVPC
+      InternetGatewayId: !Ref OnPremIGW
+
+  OnPremPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref OnPremVPC
+      CidrBlock: !FindInMap [Cidr, OnPremVpc, PublicSubnet]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: OnPrem public subnet (CGW host)
+
+  OnPremPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: OnPremVPCSecondaryCidr
+    Properties:
+      VpcId: !Ref OnPremVPC
+      CidrBlock: !FindInMap [Cidr, OnPremVpc, PrivateSubnet]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: OnPrem inspected subnet (10.132.66.0/24)
+
+  OnPremPublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref OnPremVPC
+      Tags:
+        - Key: Name
+          Value: OnPrem public RT
+
+  OnPremPublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: OnPremIGWAttachment
+    Properties:
+      RouteTableId: !Ref OnPremPublicRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref OnPremIGW
+
+  OnPremPublicRTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref OnPremPublicSubnet
+      RouteTableId: !Ref OnPremPublicRT
+
+  OnPremPrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref OnPremVPC
+      Tags:
+        - Key: Name
+          Value: OnPrem private RT
+
+  # Workload subnet reaches the inspection VPC by going through the strongSwan EC2.
+  OnPremPrivateRouteToInspection:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref OnPremPrivateRT
+      DestinationCidrBlock: !FindInMap [Cidr, InspectionVpc, Vpc]
+      InstanceId: !Ref StrongSwanInstance
+
+  # Default route: anything not in 10/8 (the BGP-announced range)
+  # exits the IDC subnet via the strongSwan EC2, which SNATs to
+  # its own EIP at the IGW edge. This gives the IDC workload
+  # internet egress without standing up a real NAT gateway.
+  OnPremPrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref OnPremPrivateRT
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref StrongSwanInstance
+
+  OnPremPrivateRTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref OnPremPrivateSubnet
+      RouteTableId: !Ref OnPremPrivateRT
+
+  # ============================================================
+  # Elastic IP + dedicated ENI for the strongSwan gateway.
+  # The EIP is associated to the ENI before the instance launches,
+  # so user-data has internet on first boot.
+  # ============================================================
+  StrongSwanEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: OnPremIGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: StrongSwan CGW EIP
+
+  StrongSwanENI:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref OnPremPublicSubnet
+      Description: StrongSwan CGW primary ENI
+      SourceDestCheck: false
+      GroupSet:
+        - !Ref StrongSwanSG
+      Tags:
+        - Key: Name
+          Value: StrongSwan CGW ENI
+
+  StrongSwanEIPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt StrongSwanEIP.AllocationId
+      NetworkInterfaceId: !Ref StrongSwanENI
+
+  # ============================================================
+  # Customer Gateway + Site-to-Site VPN
+  # ============================================================
+  CustomerGateway:
+    Type: AWS::EC2::CustomerGateway
+    Properties:
+      Type: ipsec.1
+      BgpAsn: !Ref CustomerBgpAsn
+      IpAddress: !Ref StrongSwanEIP
+      Tags:
+        - Key: Name
+          Value: Simulated OnPrem CGW
+
+  VPNConnection:
+    Type: AWS::EC2::VPNConnection
+    DependsOn: VGWAttachment
+    Properties:
+      Type: ipsec.1
+      CustomerGatewayId: !Ref CustomerGateway
+      VpnGatewayId: !Ref VGW
+      StaticRoutesOnly: false
+      VpnTunnelOptionsSpecifications:
+        - PreSharedKey: !Ref Tunnel1PreSharedKey
+          TunnelInsideCidr: !FindInMap [Cidr, Vpn, Tunnel1Inside]
+        - PreSharedKey: !Ref Tunnel2PreSharedKey
+          TunnelInsideCidr: !FindInMap [Cidr, Vpn, Tunnel2Inside]
+      Tags:
+        - Key: Name
+          Value: VGW S2S VPN (DX simulator)
+
+
+  # ============================================================
+  # Network Firewall - Stateful rule group (temporary allow-all for debug)
+  # ============================================================
+  NFWStatefulAllowAll:
+    Type: AWS::NetworkFirewall::RuleGroup
+    Properties:
+      RuleGroupName: !Sub '${AWS::StackName}-allow-all-debug'
+      Type: STATEFUL
+      Capacity: 10
+      Description: Temporary stateful rule group passing all traffic in either direction
+      RuleGroup:
+        RulesSource:
+          StatefulRules:
+            - Action: PASS
+              Header:
+                Protocol: IP
+                Source: ANY
+                SourcePort: ANY
+                Destination: ANY
+                DestinationPort: ANY
+                Direction: ANY
+              RuleOptions:
+                - Keyword: 'sid'
+                  Settings: ['1000001']
+                - Keyword: 'rev'
+                  Settings: ['1']
+        StatefulRuleOptions:
+          RuleOrder: STRICT_ORDER
+      Tags:
+        - Key: Name
+          Value: Stateful allow-all debug rule group
+
+  # ============================================================
+  # Network Firewall - Stateful rule group (block IDC -> cloud EC2 HTTP/80)
+  #
+  # Drops TCP/80 traffic originating from the simulated IDC address
+  # space (10.0.0.0/16 + 10.132.0.0/16) toward the cloud workload
+  # subnets (PrivateSubnetAZ1/AZ2). Everything else is untouched and
+  # falls through to the allow-all group below.
+  #
+  # In STRICT_ORDER the engine evaluates rule groups from the lowest
+  # priority number up and stops at the first match. This group is
+  # referenced at Priority 1 (see NFWPolicy), ahead of the allow-all
+  # group at Priority 100, so port-80 flows are dropped first while
+  # all other flows reach the pass-all rule.
+  #
+  # CIDRs are injected from the Cidr mapping via Fn::Sub so the rule
+  # stays in sync with the subnet definitions.
+  # ============================================================
+  NFWStatefulBlockIdcHttp:
+    Type: AWS::NetworkFirewall::RuleGroup
+    Properties:
+      RuleGroupName: !Sub '${AWS::StackName}-block-idc-http'
+      Type: STATEFUL
+      Capacity: 10
+      Description: Drop TCP/80 from simulated IDC ranges to cloud EC2 subnets
+      RuleGroup:
+        RulesSource:
+          RulesString: !Sub
+            - 'drop tcp [${IdcCidr1},${IdcCidr2}] any -> [${CloudSubnetAZ1},${CloudSubnetAZ2}] 80 (msg:"Block IDC to cloud EC2 subnets HTTP port 80"; flow:to_server; sid:1000010; rev:1;)'
+            - IdcCidr1: !FindInMap [Cidr, OnPremVpc, Vpc]
+              IdcCidr2: !FindInMap [Cidr, OnPremVpc, VpcSecondary]
+              CloudSubnetAZ1: !FindInMap [Cidr, InspectionVpc, PrivateSubnetAZ1]
+              CloudSubnetAZ2: !FindInMap [Cidr, InspectionVpc, PrivateSubnetAZ2]
+        StatefulRuleOptions:
+          RuleOrder: STRICT_ORDER
+      Tags:
+        - Key: Name
+          Value: Stateful block IDC HTTP rule group
+
+  # ============================================================
+  # Network Firewall - Stateful rule group (block EGRESS to a test domain)
+  #
+  # NEW in the nat-egress fork. Demonstrates outbound internet
+  # inspection: cloud workloads can reach the internet through
+  # NFW -> NAT -> IGW, but any HTTP/HTTPS request whose Host /
+  # TLS SNI ends with 'google.com' is dropped. Because egress is
+  # inspected BEFORE NAT, the firewall sees the real workload
+  # source IP, and domain matching works on the un-NATed flow.
+  # google.com is used as a real, always-reachable domain so the
+  # block is easy to verify (curl google.com fails, curl others pass).
+  #
+  # Referenced at Priority 2 in NFWPolicy (after block-idc-http=1,
+  # before allow-all=100), so the domain block wins over allow-all
+  # while every other destination still passes.
+  # ============================================================
+  NFWStatefulBlockEgressDomain:
+    Type: AWS::NetworkFirewall::RuleGroup
+    Properties:
+      RuleGroupName: !Sub '${AWS::StackName}-block-egress-domain'
+      Type: STATEFUL
+      Capacity: 20
+      Description: Drop egress HTTP/HTTPS to google.com from cloud workloads
+      RuleGroup:
+        RulesSource:
+          RulesString: |
+            drop http any any -> any any (msg:"Block egress HTTP to google.com"; flow:to_server; http.host; content:"google.com"; nocase; endswith; sid:1000020; rev:1;)
+            drop tls any any -> any any (msg:"Block egress TLS to google.com"; flow:to_server; tls.sni; content:"google.com"; nocase; endswith; sid:1000021; rev:1;)
+        StatefulRuleOptions:
+          RuleOrder: STRICT_ORDER
+      Tags:
+        - Key: Name
+          Value: Stateful block egress domain rule group
+
+  # ============================================================
+  # Network Firewall - Firewall policy (strict order, default drop)
+  # ============================================================
+  NFWPolicy:
+    Type: AWS::NetworkFirewall::FirewallPolicy
+    Properties:
+      FirewallPolicyName: !Sub '${AWS::StackName}-policy'
+      Description: VGW-DX inspection policy, strict order, default drop, with debug allow-all
+      FirewallPolicy:
+        StatelessDefaultActions:
+          - 'aws:forward_to_sfe'
+        StatelessFragmentDefaultActions:
+          - 'aws:forward_to_sfe'
+        StatefulRuleGroupReferences:
+          - ResourceArn: !Ref NFWStatefulBlockIdcHttp
+            Priority: 1
+          - ResourceArn: !Ref NFWStatefulBlockEgressDomain
+            Priority: 2
+          - ResourceArn: !Ref NFWStatefulAllowAll
+            Priority: 100
+        StatefulDefaultActions:
+          - 'aws:drop_established'
+        StatefulEngineOptions:
+          RuleOrder: STRICT_ORDER
+          StreamExceptionPolicy: DROP
+      Tags:
+        - Key: Name
+          Value: NFW VGW-DX policy
+
+  # ============================================================
+  # Network Firewall - Firewall
+  # ============================================================
+  NFWFirewall:
+    Type: AWS::NetworkFirewall::Firewall
+    Properties:
+      FirewallName: !Sub '${AWS::StackName}-firewall'
+      FirewallPolicyArn: !Ref NFWPolicy
+      VpcId: !Ref InspectionVPC
+      SubnetMappings:
+        - SubnetId: !Ref FirewallSubnetAZ1
+        - SubnetId: !Ref FirewallSubnetAZ2
+      # 开启流量分析模式（Traffic analysis mode），采集 HTTP/HTTPS 指标用于生成流量分析报表。
+      # 该模式仅在现有检测之上附加指标采集，不改变规则的放行/拦截行为。
+      # TLS_SNI 对应 HTTPS 报表，HTTP_HOST 对应 HTTP 报表。
+      EnabledAnalysisTypes:
+        - TLS_SNI
+        - HTTP_HOST
+      DeleteProtection: false
+      SubnetChangeProtection: false
+      FirewallPolicyChangeProtection: false
+      Description: NFW inspecting VPC <-> simulated DX traffic
+      Tags:
+        - Key: Name
+          Value: Inspection NFW
+
+  # ============================================================
+  # Network Firewall - CloudWatch log groups
+  #
+  # Two log types are wired up: FLOW (every connection) and
+  # ALERT (only flows that hit a stateful rule with action
+  # alert/drop/reject). Both groups are stack-managed so they
+  # get torn down with the stack.
+  # ============================================================
+  NFWFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/network-firewall/${AWS::StackName}/flow'
+      RetentionInDays: 14
+
+  NFWAlertLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/network-firewall/${AWS::StackName}/alert'
+      RetentionInDays: 14
+
+  # ============================================================
+  # Network Firewall - Logging configuration
+  #
+  # Stack-managed so 'cloudformation delete-stack' tears the
+  # logging binding down before deleting NFWFirewall, avoiding
+  # 'Cannot delete firewall with a logging configuration'.
+  # ============================================================
+  NFWLoggingConfiguration:
+    Type: AWS::NetworkFirewall::LoggingConfiguration
+    Properties:
+      FirewallArn: !Ref NFWFirewall
+      LoggingConfiguration:
+        LogDestinationConfigs:
+          - LogType: FLOW
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref NFWFlowLogGroup
+          - LogType: ALERT
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref NFWAlertLogGroup
+
+  # ============================================================
+  # Lambda IAM role - resolves NFW endpoint IDs and VPN tunnel info
+  # ============================================================
+  ResolverLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ResolverPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - network-firewall:DescribeFirewall
+                  - ec2:DescribeVpnConnections
+                  - ec2:DescribeRouteTables
+                  - ec2:DeleteRoute
+                  - ec2:CreateKeyPair
+                  - ec2:DeleteKeyPair
+                  - ec2:DescribeKeyPairs
+                Resource: '*'
+
+  # ============================================================
+  # Lambda - Wait for NFW endpoints to be ready, return VPCE IDs per AZ
+  # ============================================================
+  NFWEndpointResolverLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-nfw-endpoint-resolver'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 600
+      Role: !GetAtt ResolverLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json, time, boto3, urllib3
+          http = urllib3.PoolManager()
+          def send(event, context, status, data=None, reason=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'See log stream {context.log_stream_name}',
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {}
+              })
+              http.request('PUT', event['ResponseURL'], body=body,
+                           headers={'Content-Type': 'application/json'})
+          def handler(event, context):
+              print(json.dumps(event))
+              if event['RequestType'] == 'Delete':
+                  send(event, context, 'SUCCESS'); return
+              try:
+                  p = event['ResourceProperties']
+                  name, az1, az2 = p['FirewallName'], p['AZ1'], p['AZ2']
+                  c = boto3.client('network-firewall')
+                  for i in range(60):
+                      r = c.describe_firewall(FirewallName=name)
+                      st = r.get('FirewallStatus', {})
+                      sync = st.get('SyncStates', {})
+                      print(f'attempt {i+1} status={st.get("Status")} azs={list(sync.keys())}')
+                      if st.get('Status') == 'READY' and len(sync) >= 2:
+                          e1 = sync.get(az1, {}).get('Attachment', {}).get('EndpointId')
+                          e2 = sync.get(az2, {}).get('Attachment', {}).get('EndpointId')
+                          if e1 and e2:
+                              send(event, context, 'SUCCESS',
+                                   {'EndpointIdAZ1': e1, 'EndpointIdAZ2': e2})
+                              return
+                      time.sleep(10)
+                  send(event, context, 'FAILED', reason='Timed out waiting for NFW endpoints')
+              except Exception as e:
+                  print('error', e)
+                  send(event, context, 'FAILED', reason=str(e))
+
+  NFWEndpointResolver:
+    Type: Custom::NFWEndpointResolver
+    DependsOn: NFWFirewall
+    Properties:
+      ServiceToken: !GetAtt NFWEndpointResolverLambda.Arn
+      FirewallName: !Sub '${AWS::StackName}-firewall'
+      AZ1: !Select [0, !GetAZs '']
+      AZ2: !Select [1, !GetAZs '']
+
+  # ============================================================
+  # Lambda - Resolve VPN tunnel parameters (outside IPs, inside CIDRs)
+  # ============================================================
+  VPNInfoResolverLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-vpn-info-resolver'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt ResolverLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json, time, boto3, urllib3, xml.etree.ElementTree as ET
+          http = urllib3.PoolManager()
+          def send(event, context, status, data=None, reason=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'See log stream {context.log_stream_name}',
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {}
+              })
+              http.request('PUT', event['ResponseURL'], body=body,
+                           headers={'Content-Type': 'application/json'})
+          def handler(event, context):
+              print(json.dumps(event))
+              if event['RequestType'] == 'Delete':
+                  send(event, context, 'SUCCESS'); return
+              try:
+                  vpn_id = event['ResourceProperties']['VpnConnectionId']
+                  c = boto3.client('ec2')
+                  for _ in range(30):
+                      r = c.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+                      v = r['VpnConnections'][0]
+                      cfg = v.get('CustomerGatewayConfiguration', '')
+                      if cfg:
+                          break
+                      time.sleep(10)
+                  if not cfg:
+                      send(event, context, 'FAILED', reason='vpn config not ready'); return
+                  root = ET.fromstring(cfg)
+                  tunnels = root.findall('ipsec_tunnel')
+                  out = {}
+                  for idx, t in enumerate(tunnels[:2], start=1):
+                      cgw = t.find('customer_gateway/tunnel_outside_address/ip_address').text
+                      vgw = t.find('vpn_gateway/tunnel_outside_address/ip_address').text
+                      cgw_in = t.find('customer_gateway/tunnel_inside_address/ip_address').text
+                      cgw_inm = t.find('customer_gateway/tunnel_inside_address/network_mask').text
+                      vgw_in = t.find('vpn_gateway/tunnel_inside_address/ip_address').text
+                      psk = t.find('ike/pre_shared_key').text
+                      vgw_asn = t.find('vpn_gateway/bgp/asn').text
+                      cgw_asn = t.find('customer_gateway/bgp/asn').text
+                      out[f'Tunnel{idx}OutsideCgw'] = cgw
+                      out[f'Tunnel{idx}OutsideVgw'] = vgw
+                      out[f'Tunnel{idx}InsideCgw'] = cgw_in
+                      out[f'Tunnel{idx}InsideCgwMask'] = cgw_inm
+                      out[f'Tunnel{idx}InsideVgw'] = vgw_in
+                      out[f'Tunnel{idx}Psk'] = psk
+                      out[f'Tunnel{idx}VgwAsn'] = vgw_asn
+                      out[f'Tunnel{idx}CgwAsn'] = cgw_asn
+                  print('resolved', {k: v for k, v in out.items() if 'Psk' not in k})
+                  send(event, context, 'SUCCESS', out)
+              except Exception as e:
+                  print('error', e)
+                  send(event, context, 'FAILED', reason=str(e))
+
+  VPNInfoResolver:
+    Type: Custom::VPNInfoResolver
+    Properties:
+      ServiceToken: !GetAtt VPNInfoResolverLambda.Arn
+      VpnConnectionId: !Ref VPNConnection
+
+  # ============================================================
+  # Lambda - Route cleanup on stack delete
+  #
+  # Per the operator runbook, the user adds routes pointing at
+  # the NFW VPC endpoints (vpce-id) into the private route
+  # tables and the VGW ingress route table. CFN does not know
+  # about those manual entries, so on 'delete-stack' the
+  # firewall fails with 'related VPC endpoint(s) still exist
+  # in route table(s)'. This custom resource scans every route
+  # table in the inspection VPC at delete time and removes any
+  # route whose target is the firewall's endpoint ids, before
+  # CFN tries to delete NFWFirewall.
+  # ============================================================
+  RouteCleanupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-route-cleanup'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt ResolverLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json, boto3, urllib3
+          http = urllib3.PoolManager()
+          def send(event, context, status, data=None, reason=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'See log stream {context.log_stream_name}',
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {}
+              })
+              http.request('PUT', event['ResponseURL'], body=body,
+                           headers={'Content-Type': 'application/json'})
+          def handler(event, context):
+              print(json.dumps(event))
+              # Only act on Delete; Create/Update is a no-op.
+              if event['RequestType'] != 'Delete':
+                  send(event, context, 'SUCCESS'); return
+              try:
+                  p = event['ResourceProperties']
+                  vpc_id = p['VpcId']
+                  endpoint_ids = set(filter(None, [p.get('EndpointIdAZ1'), p.get('EndpointIdAZ2')]))
+                  c = boto3.client('ec2')
+                  rts = c.describe_route_tables(
+                      Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
+                  )['RouteTables']
+                  removed = 0
+                  for rt in rts:
+                      rtb_id = rt['RouteTableId']
+                      for r in rt.get('Routes', []):
+                          # NFW endpoints land in the route table as
+                          # GatewayId starting with 'vpce-' or as
+                          # VpcEndpointId, depending on API version.
+                          target = r.get('GatewayId') or r.get('VpcEndpointId')
+                          if not target or not target.startswith('vpce-'):
+                              continue
+                          if endpoint_ids and target not in endpoint_ids:
+                              continue
+                          dst = r.get('DestinationCidrBlock') or r.get('DestinationIpv6CidrBlock') or r.get('DestinationPrefixListId')
+                          print(f'deleting route {dst} -> {target} from {rtb_id}')
+                          kwargs = {'RouteTableId': rtb_id}
+                          if r.get('DestinationCidrBlock'):
+                              kwargs['DestinationCidrBlock'] = r['DestinationCidrBlock']
+                          elif r.get('DestinationIpv6CidrBlock'):
+                              kwargs['DestinationIpv6CidrBlock'] = r['DestinationIpv6CidrBlock']
+                          elif r.get('DestinationPrefixListId'):
+                              kwargs['DestinationPrefixListId'] = r['DestinationPrefixListId']
+                          try:
+                              c.delete_route(**kwargs)
+                              removed += 1
+                          except Exception as ex:
+                              print(f'delete_route failed (continuing): {ex}')
+                  print(f'removed {removed} NFW-endpoint routes')
+                  send(event, context, 'SUCCESS', {'RemovedRoutes': removed})
+              except Exception as e:
+                  print('error', e)
+                  # Never fail the stack delete on cleanup errors.
+                  send(event, context, 'SUCCESS', reason=f'cleanup error ignored: {e}')
+
+  # NFWFirewall depends on this resource. On Delete, CFN tears
+  # children down before parents, so this Lambda runs first
+  # and clears the operator-added routes that would otherwise
+  # block firewall deletion.
+  RouteCleanup:
+    Type: Custom::RouteCleanup
+    DependsOn:
+      - NFWEndpointResolver
+    Properties:
+      ServiceToken: !GetAtt RouteCleanupLambda.Arn
+      VpcId: !Ref InspectionVPC
+      EndpointIdAZ1: !GetAtt NFWEndpointResolver.EndpointIdAZ1
+      EndpointIdAZ2: !GetAtt NFWEndpointResolver.EndpointIdAZ2
+
+  # ============================================================
+  # Lambda - Generate a one-shot RSA keypair used to wire up
+  # passwordless SSH between the three workload EC2s.
+  #
+  # On Create: ec2:CreateKeyPair returns the PEM-encoded private
+  # key in 'KeyMaterial'; describe_key_pairs(IncludePublicKey=True)
+  # returns the matching OpenSSH-format public key. Both are
+  # returned as Data so the workload EC2 UserData can embed them
+  # via Fn::Sub. The KeyPair is also stored in EC2 so that on
+  # stack delete we can clean it up.
+  # On Delete: the KeyPair gets removed.
+  # ============================================================
+  SshMeshKeyGenLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ssh-mesh-keygen'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt ResolverLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json, boto3, urllib3, traceback
+          http = urllib3.PoolManager()
+          def send(event, context, status, data=None, reason=None, physical_id=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'See log stream {context.log_stream_name}',
+                  'PhysicalResourceId': physical_id or context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'NoEcho': True,
+                  'Data': data or {}
+              })
+              http.request('PUT', event['ResponseURL'], body=body,
+                           headers={'Content-Type': 'application/json'})
+          def handler(event, context):
+              # Avoid logging private key material; print the request
+              # type and resource properties only.
+              print('RequestType', event.get('RequestType'),
+                    'LogicalResourceId', event.get('LogicalResourceId'))
+              ec2 = boto3.client('ec2')
+              key_name = event['ResourceProperties']['KeyName']
+              try:
+                  if event['RequestType'] == 'Delete':
+                      try:
+                          ec2.delete_key_pair(KeyName=key_name)
+                      except Exception as ex:
+                          print(f'delete_key_pair ignored: {ex}')
+                      send(event, context, 'SUCCESS', physical_id=key_name)
+                      return
+                  if event['RequestType'] == 'Update':
+                      # Reuse existing key on update to avoid
+                      # rotating credentials underneath running EC2s.
+                      send(event, context, 'SUCCESS',
+                           {'KeyName': key_name},
+                           physical_id=key_name)
+                      return
+                  # Create: generate a fresh RSA keypair.
+                  # If a leftover with the same name exists (rare,
+                  # only on retried creates) drop it first.
+                  try:
+                      ec2.delete_key_pair(KeyName=key_name)
+                  except Exception:
+                      pass
+                  resp = ec2.create_key_pair(
+                      KeyName=key_name, KeyType='rsa', KeyFormat='pem')
+                  private_key = resp['KeyMaterial']
+                  desc = ec2.describe_key_pairs(
+                      KeyNames=[key_name], IncludePublicKey=True)
+                  public_key = desc['KeyPairs'][0]['PublicKey']
+                  send(event, context, 'SUCCESS',
+                       {'KeyName': key_name,
+                        'PrivateKey': private_key,
+                        'PublicKey': public_key},
+                       physical_id=key_name)
+              except Exception as e:
+                  traceback.print_exc()
+                  send(event, context, 'FAILED', reason=str(e),
+                       physical_id=key_name)
+
+  SshMeshKeyGen:
+    Type: Custom::SshMeshKeyGen
+    Properties:
+      ServiceToken: !GetAtt SshMeshKeyGenLambda.Arn
+      KeyName: !Sub '${AWS::StackName}-ssh-mesh'
+
+
+  # ============================================================
+  # Inspection VPC route tables - Firewall subnets
+  #
+  # These route tables enable VGW route propagation. The on-prem
+  # prefixes (10.0.0.0/8 + 10.132.66.0/24) advertised by FRR over
+  # BGP arrive here as VGW-propagated routes, so the firewall
+  # subnet automatically forwards inspected traffic onward to the
+  # VGW. No static on-prem route is needed here.
+  # ============================================================
+  FirewallRouteTableAZ1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: fw-rt-az1
+
+  FirewallRoutePropagationAZ1:
+    Type: AWS::EC2::VPNGatewayRoutePropagation
+    DependsOn: VGWAttachment
+    Properties:
+      RouteTableIds:
+        - !Ref FirewallRouteTableAZ1
+      VpnGatewayId: !Ref VGW
+
+  FirewallSubnetRouteTableAssociationAZ1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref FirewallSubnetAZ1
+      RouteTableId: !Ref FirewallRouteTableAZ1
+
+  FirewallRouteTableAZ2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: fw-rt-az2
+
+  FirewallRoutePropagationAZ2:
+    Type: AWS::EC2::VPNGatewayRoutePropagation
+    DependsOn: VGWAttachment
+    Properties:
+      RouteTableIds:
+        - !Ref FirewallRouteTableAZ2
+      VpnGatewayId: !Ref VGW
+
+  FirewallSubnetRouteTableAssociationAZ2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref FirewallSubnetAZ2
+      RouteTableId: !Ref FirewallRouteTableAZ2
+
+  # NEW (nat-egress fork): after NFW inspects an egress flow, the
+  # firewall subnet forwards it to the per-AZ NAT Gateway for SNAT.
+  # The propagated on-prem prefixes (10.0.0.0/8, 10.132.66.0/24 -> VGW)
+  # are more specific than 0.0.0.0/0, so east-west traffic to the IDC
+  # still goes to the VGW; only internet-bound traffic hits the NAT.
+  FirewallDefaultRouteToNatAZ1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref FirewallRouteTableAZ1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayAZ1
+
+  FirewallDefaultRouteToNatAZ2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref FirewallRouteTableAZ2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayAZ2
+
+  # ============================================================
+  # Inspection VPC route tables - Private workload subnets
+  #
+  # Default state: VGW route propagation is ENABLED, so on-prem
+  # prefixes (10.0.0.0/8 + 10.132.66.0/24) advertised by FRR over
+  # BGP appear here as VGW-targeted routes and traffic flows
+  # directly through the VGW, BYPASSING NFW. This is intentional:
+  # the experiment first validates a fully working BGP path with
+  # NFW idle, then the operator manually steers traffic through
+  # NFW by adding static, longest-prefix routes that override the
+  # propagated routes:
+  #   prv-rt-az1: 10.132.66.0/24 -> NFW endpoint AZ1
+  #   prv-rt-az2: 10.132.66.0/24 -> NFW endpoint AZ2
+  # Static /24 wins over propagated /8 by longest prefix; for the
+  # exact /24 advertised by BGP, longest-prefix is a tie so AWS
+  # prefers the static route over the propagated one.
+  # ============================================================
+  PrivateRouteTableAZ1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: prv-rt-az1
+
+  PrivateRoutePropagationAZ1:
+    Type: AWS::EC2::VPNGatewayRoutePropagation
+    DependsOn: VGWAttachment
+    Properties:
+      RouteTableIds:
+        - !Ref PrivateRouteTableAZ1
+      VpnGatewayId: !Ref VGW
+
+  PrivateSubnetRouteTableAssociationAZ1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetAZ1
+      RouteTableId: !Ref PrivateRouteTableAZ1
+
+  PrivateRouteTableAZ2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: prv-rt-az2
+
+  PrivateRoutePropagationAZ2:
+    Type: AWS::EC2::VPNGatewayRoutePropagation
+    DependsOn: VGWAttachment
+    Properties:
+      RouteTableIds:
+        - !Ref PrivateRouteTableAZ2
+      VpnGatewayId: !Ref VGW
+
+  PrivateSubnetRouteTableAssociationAZ2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetAZ2
+      RouteTableId: !Ref PrivateRouteTableAZ2
+
+  # NEW (nat-egress fork): the workload default route points at the
+  # per-AZ NFW endpoint, so ALL internet-bound traffic is inspected
+  # the moment the stack finishes (no manual step needed). On-prem
+  # prefixes arrive as more-specific VGW-propagated routes and are
+  # unaffected, so the IDC east-west experiment from the original demo
+  # still works and stays operator-driven.
+  PrivateDefaultRouteToNFWAZ1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableAZ1
+      DestinationCidrBlock: 0.0.0.0/0
+      VpcEndpointId: !GetAtt NFWEndpointResolver.EndpointIdAZ1
+
+  PrivateDefaultRouteToNFWAZ2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableAZ2
+      DestinationCidrBlock: 0.0.0.0/0
+      VpcEndpointId: !GetAtt NFWEndpointResolver.EndpointIdAZ2
+
+  # ============================================================
+  # Inspection VPC route table - VGW ingress (edge association)
+  #
+  # The route table itself and the edge association are created
+  # but no per-/24 routes are added. To switch ingress traffic
+  # through NFW, add in the console:
+  #   10.87.114.0/24 -> NFW endpoint AZ1
+  #   10.87.113.0/24 -> NFW endpoint AZ2
+  # Without these, VGW ingress hits the local VPC route and
+  # bypasses NFW.
+  # ============================================================
+  VGWIngressRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: vgw-ingress-rt
+
+  VGWIngressEdgeAssociation:
+    Type: AWS::EC2::GatewayRouteTableAssociation
+    DependsOn: VGWAttachment
+    Properties:
+      GatewayId: !Ref VGW
+      RouteTableId: !Ref VGWIngressRouteTable
+
+
+  # ============================================================
+  # Security groups
+  # ============================================================
+  EICSecurityGroupInspection:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EIC endpoint SG (inspection VPC)
+      VpcId: !Ref InspectionVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !FindInMap [Cidr, InspectionVpc, Vpc]
+          Description: SSH to inspection VPC instances
+      Tags:
+        - Key: Name
+          Value: EIC SG (inspection)
+
+  EICSecurityGroupOnPrem:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EIC endpoint SG (onprem VPC)
+      VpcId: !Ref OnPremVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !FindInMap [Cidr, OnPremVpc, Vpc]
+          Description: SSH to public subnet (CGW)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !FindInMap [Cidr, OnPremVpc, PrivateSubnet]
+          Description: SSH to inspected subnet (workload)
+      Tags:
+        - Key: Name
+          Value: EIC SG (onprem)
+
+  WorkloadSGInspection:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Workload SG (inspection VPC)
+      VpcId: !Ref InspectionVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref EICSecurityGroupInspection
+          Description: SSH from EIC
+        - IpProtocol: -1
+          CidrIp: !FindInMap [Cidr, InspectionVpc, Vpc]
+          Description: Allow all from inspection VPC (intra-VPC SSH/HTTP/ICMP mesh)
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !FindInMap [Cidr, OnPremVpc, BgpAnnounce]
+          Description: ICMP from on-prem (10.0.0.0/8) for ping testing
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !FindInMap [Cidr, OnPremVpc, PrivateSubnet]
+          Description: ICMP from inspected on-prem subnet
+        - IpProtocol: -1
+          CidrIp: !FindInMap [Cidr, OnPremVpc, BgpAnnounce]
+          Description: Allow all from simulated on-prem (10.0.0.0/8)
+        - IpProtocol: -1
+          CidrIp: !FindInMap [Cidr, OnPremVpc, PrivateSubnet]
+          Description: Allow all from inspected on-prem subnet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: Workload SG (inspection)
+
+  WorkloadSGOnPrem:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Workload SG (onprem VPC)
+      VpcId: !Ref OnPremVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref EICSecurityGroupOnPrem
+          Description: SSH from EIC
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !FindInMap [Cidr, InspectionVpc, Vpc]
+          Description: ICMP from inspection VPC (ping testing)
+        - IpProtocol: -1
+          CidrIp: !FindInMap [Cidr, InspectionVpc, Vpc]
+          Description: Allow all from inspection VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: Workload SG (onprem)
+
+  StrongSwanSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: strongSwan + FRR Customer Gateway device SG
+      VpcId: !Ref OnPremVPC
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 500
+          ToPort: 500
+          CidrIp: 0.0.0.0/0
+          Description: IKE
+        - IpProtocol: udp
+          FromPort: 4500
+          ToPort: 4500
+          CidrIp: 0.0.0.0/0
+          Description: IPSec NAT-T
+        - IpProtocol: 50
+          CidrIp: 0.0.0.0/0
+          Description: ESP
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref EICSecurityGroupOnPrem
+          Description: SSH from EIC
+        - IpProtocol: -1
+          CidrIp: !FindInMap [Cidr, OnPremVpc, Vpc]
+          Description: All from onprem VPC
+        - IpProtocol: -1
+          CidrIp: !FindInMap [Cidr, OnPremVpc, VpcSecondary]
+          Description: All from onprem secondary CIDR
+        - IpProtocol: -1
+          CidrIp: !FindInMap [Cidr, InspectionVpc, Vpc]
+          Description: All from inspection VPC (transit traffic)
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: StrongSwan CGW SG
+
+  # ============================================================
+  # IAM role + instance profile for Session Manager / SSM access
+  # ============================================================
+  EC2SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2SSMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2SSMRole
+
+  # ============================================================
+  # SSM VPC endpoints (inspection VPC) so workload EC2s in the
+  # private subnets can be reached by Session Manager without an
+  # IGW or NAT gateway. Three interface endpoints are required
+  # by the SSM Agent: ssm, ssmmessages, ec2messages.
+  # ============================================================
+  SSMEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for SSM VPC interface endpoints (inspection VPC)
+      VpcId: !Ref InspectionVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !FindInMap [Cidr, InspectionVpc, Vpc]
+          Description: HTTPS from inspection VPC
+      Tags:
+        - Key: Name
+          Value: SSM endpoints SG (inspection)
+
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref InspectionVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetAZ1
+        - !Ref PrivateSubnetAZ2
+      SecurityGroupIds:
+        - !Ref SSMEndpointSG
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref InspectionVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetAZ1
+        - !Ref PrivateSubnetAZ2
+      SecurityGroupIds:
+        - !Ref SSMEndpointSG
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref InspectionVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetAZ1
+        - !Ref PrivateSubnetAZ2
+      SecurityGroupIds:
+        - !Ref SSMEndpointSG
+
+  # ============================================================
+  # SSM VPC endpoints (on-prem VPC) so the IDC workload EC2 can
+  # use Session Manager without an IGW or NAT gateway.
+  # ============================================================
+  SSMEndpointSGOnPrem:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for SSM VPC interface endpoints (onprem VPC)
+      VpcId: !Ref OnPremVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !FindInMap [Cidr, OnPremVpc, Vpc]
+          Description: HTTPS from onprem VPC
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !FindInMap [Cidr, OnPremVpc, VpcSecondary]
+          Description: HTTPS from onprem secondary CIDR
+      Tags:
+        - Key: Name
+          Value: SSM endpoints SG (onprem)
+
+  SSMEndpointOnPrem:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref OnPremVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref OnPremPrivateSubnet
+      SecurityGroupIds:
+        - !Ref SSMEndpointSGOnPrem
+
+  SSMMessagesEndpointOnPrem:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref OnPremVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref OnPremPrivateSubnet
+      SecurityGroupIds:
+        - !Ref SSMEndpointSGOnPrem
+
+  EC2MessagesEndpointOnPrem:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref OnPremVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref OnPremPrivateSubnet
+      SecurityGroupIds:
+        - !Ref SSMEndpointSGOnPrem
+
+  # ============================================================
+  # EC2 Instance Connect Endpoints
+  # ============================================================
+  EICEndpointInspection:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Properties:
+      SubnetId: !Ref PrivateSubnetAZ1
+      PreserveClientIp: false
+      SecurityGroupIds:
+        - !Ref EICSecurityGroupInspection
+      Tags:
+        - Key: Name
+          Value: EIC (inspection VPC)
+
+  EICEndpointOnPrem:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Properties:
+      SubnetId: !Ref OnPremPrivateSubnet
+      PreserveClientIp: false
+      SecurityGroupIds:
+        - !Ref EICSecurityGroupOnPrem
+      Tags:
+        - Key: Name
+          Value: EIC (onprem VPC)
+
+
+  # ============================================================
+  # strongSwan + FRR EC2 - simulated Customer Gateway device
+  # Two IPSec tunnels to AWS VGW with BGP advertising the on-prem
+  # workload subnet (10.99.10.0/24).
+  # ============================================================
+  StrongSwanInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - StrongSwanEIPAssoc
+    Properties:
+      InstanceType: t4g.small
+      ImageId: !Ref LatestUbuntuArmAmiId
+      KeyName: !Ref KeyPairName
+      SourceDestCheck: false
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref StrongSwanENI
+          DeviceIndex: 0
+      Tags:
+        - Key: Name
+          Value: StrongSwan + FRR CGW
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euxo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y strongswan frr frr-pythontools iproute2
+
+            # Detect primary interface (Nitro names vary: enX0, ens5, eth0, ...)
+            PRIMARY_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+            LOCAL_PRIV=$(ip -o -4 addr show dev "${!PRIMARY_IF}" | awk '{print $4}' | cut -d/ -f1)
+            echo "primary_if=${!PRIMARY_IF} local_priv=${!LOCAL_PRIV}"
+
+            # IP forwarding + relaxed rp_filter for VTI traffic
+            cat >/etc/sysctl.d/99-vpn-router.conf <<EOF
+            net.ipv4.ip_forward=1
+            net.ipv4.conf.all.accept_redirects=0
+            net.ipv4.conf.all.send_redirects=0
+            net.ipv4.conf.all.rp_filter=0
+            net.ipv4.conf.default.rp_filter=0
+            EOF
+            sysctl --system
+
+            # ==============================
+            # strongSwan - dual VTI route-based tunnels (active/passive).
+            # Both AWS tunnels are brought UP so the S2S VPN console shows
+            # 2/2 tunnels UP. Tunnel1 is primary, Tunnel2 is the standby
+            # path (BGP attributes below steer traffic onto Tunnel1 and
+            # fail over to Tunnel2 only when Tunnel1 drops).
+            #
+            # Each tunnel MUST stay isolated on three keys so the kernel
+            # never picks the wrong SA for a marked packet:
+            #   Tunnel1 -> reqid 1 / fwmark 0x64 (100) / vti key 100
+            #   Tunnel2 -> reqid 2 / fwmark 0xc8 (200) / vti key 200
+            # reqid is pinned explicitly in each conn so the SA reqid is
+            # deterministic and matches the manual xfrm policies below.
+            #
+            # Algorithms: IKEv2 + AES-256 + SHA-256 + DH group 14, well
+            # within AWS S2S VPN default Phase 1/2 proposal lists.
+            # ==============================
+            cat >/etc/ipsec.conf <<EOF
+            config setup
+                charondebug="ike 1, knl 1, cfg 0"
+                uniqueids=no
+
+            conn AWS-VPN-Tunnel1
+                left=%defaultroute
+                leftid=${StrongSwanEIPRef}
+                leftsubnet=0.0.0.0/0
+                right=${T1OutsideVgw}
+                rightid=${T1OutsideVgw}
+                rightsubnet=0.0.0.0/0
+                authby=psk
+                keyexchange=ikev2
+                ike=aes256-sha256-modp2048!
+                esp=aes256-sha256-modp2048!
+                ikelifetime=28800s
+                lifetime=3600s
+                dpddelay=10s
+                dpdtimeout=30s
+                dpdaction=restart
+                type=tunnel
+                installpolicy=no
+                reqid=1
+                mark=100
+                keyingtries=%forever
+                auto=start
+
+            conn AWS-VPN-Tunnel2
+                left=%defaultroute
+                leftid=${StrongSwanEIPRef}
+                leftsubnet=0.0.0.0/0
+                right=${T2OutsideVgw}
+                rightid=${T2OutsideVgw}
+                rightsubnet=0.0.0.0/0
+                authby=psk
+                keyexchange=ikev2
+                ike=aes256-sha256-modp2048!
+                esp=aes256-sha256-modp2048!
+                ikelifetime=28800s
+                lifetime=3600s
+                dpddelay=10s
+                dpdtimeout=30s
+                dpdaction=restart
+                type=tunnel
+                installpolicy=no
+                reqid=2
+                mark=200
+                keyingtries=%forever
+                auto=start
+            EOF
+
+            cat >/etc/ipsec.secrets <<EOF
+            ${StrongSwanEIPRef} ${T1OutsideVgw} : PSK "${T1Psk}"
+            ${StrongSwanEIPRef} ${T2OutsideVgw} : PSK "${T2Psk}"
+            EOF
+            chmod 600 /etc/ipsec.secrets
+
+            # ==============================
+            # iptables mangle - mark outbound traffic per VTI so it matches
+            # the strongSwan outbound SA which is keyed by fwmark.
+            #   vti1 -> 0x64 (100)  (Tunnel1, primary)
+            #   vti2 -> 0xc8 (200)  (Tunnel2, standby)
+            # Without these, kernel cannot find an SA and replies with EHOSTUNREACH.
+            # ==============================
+            cat >/etc/iptables-vti.rules <<'EOF'
+            *mangle
+            -A OUTPUT -o vti1 -j MARK --set-xmark 0x64/0xffffffff
+            -A FORWARD -o vti1 -j MARK --set-xmark 0x64/0xffffffff
+            -A OUTPUT -o vti2 -j MARK --set-xmark 0xc8/0xffffffff
+            -A FORWARD -o vti2 -j MARK --set-xmark 0xc8/0xffffffff
+            COMMIT
+            EOF
+            apt-get install -y iptables-persistent netfilter-persistent
+            iptables -t mangle -A OUTPUT -o vti1 -j MARK --set-xmark 0x64/0xffffffff
+            iptables -t mangle -A FORWARD -o vti1 -j MARK --set-xmark 0x64/0xffffffff
+            iptables -t mangle -A OUTPUT -o vti2 -j MARK --set-xmark 0xc8/0xffffffff
+            iptables -t mangle -A FORWARD -o vti2 -j MARK --set-xmark 0xc8/0xffffffff
+
+            # ==============================
+            # iptables nat - SNAT (MASQUERADE) for two distinct egress
+            # use cases:
+            # 1) StrongSwan itself egressing to the internet for apt /
+            #    boot tasks. Source matches the EC2's primary IP.
+            # 2) IDC subnet 10.132.66.0/24 egressing to the internet
+            #    after we set 0.0.0.0/0 -> StrongSwan in OnPremPrivateRT.
+            #    Without SNAT the IGW drops the 10.132.66.x source.
+            #
+            # Filters:
+            #   -o $PRIMARY_IF : only main NIC egress; vti1 (VPN to AWS)
+            #                    is NEVER masqueraded, so the 10.132.66.x
+            #                    -> 10.87.x.x flow keeps its real source
+            #                    IP and NFW logs read true.
+            #   ! -d 10.0.0.0/8: do not SNAT any traffic destined to the
+            #                    on-prem secondary CIDR or the BGP-announced
+            #                    range; transit flows stay symmetric.
+            # ==============================
+            iptables -t nat -A POSTROUTING -o "${!PRIMARY_IF}" \
+                ! -d 10.0.0.0/8 -j MASQUERADE
+            netfilter-persistent save || true
+
+            # ==============================
+            # VTI interface bring-up + xfrm policy + blackhole routes
+            # 1) VTI1/VTI2 carry the BGP+IPSec traffic (route-based VPN).
+            #    VTI1 = Tunnel1 (primary), VTI2 = Tunnel2 (standby).
+            # 2) strongSwan in route-based mode does not install xfrm
+            #    policies, so we install them here keyed by fwmark. Each
+            #    tunnel uses its own reqid + mark so the kernel matches
+            #    the right SA:
+            #      vti1 -> reqid 1 / mark 0x64
+            #      vti2 -> reqid 2 / mark 0xc8
+            #    Without these, kernel finds no SA template and outbound
+            #    traffic on the vti fails with EHOSTUNREACH.
+            # 3) FRR will only advertise a 'network' prefix that has a
+            #    matching kernel route. Add blackhole routes for the
+            #    on-prem prefixes so BGP actually announces them.
+            # ==============================
+            cat >/usr/local/sbin/aws-vpn-vti.sh <<EOF
+            #!/bin/bash
+            set -e
+            LOCAL=\$(ip -o -4 route show to default | awk '{print \$5}' | head -1)
+            LOCAL_IP=\$(ip -o -4 addr show dev \$LOCAL | awk '{print \$4}' | cut -d/ -f1)
+
+            # VTI1 (Tunnel1, primary)
+            ip link add vti1 type vti local \$LOCAL_IP remote ${T1OutsideVgw} key 100 2>/dev/null || true
+            ip addr add ${T1InsideCgw}/30 dev vti1 2>/dev/null || true
+            ip link set vti1 mtu 1419 up
+            sysctl -w net.ipv4.conf.vti1.disable_policy=1
+            sysctl -w net.ipv4.conf.vti1.rp_filter=0
+
+            # VTI2 (Tunnel2, standby)
+            ip link add vti2 type vti local \$LOCAL_IP remote ${T2OutsideVgw} key 200 2>/dev/null || true
+            ip addr add ${T2InsideCgw}/30 dev vti2 2>/dev/null || true
+            ip link set vti2 mtu 1419 up
+            sysctl -w net.ipv4.conf.vti2.disable_policy=1
+            sysctl -w net.ipv4.conf.vti2.rp_filter=0
+
+            # xfrm policies for Tunnel1 (reqid 1 / mark 0x64 = 100)
+            ip xfrm policy add src 0.0.0.0/0 dst 0.0.0.0/0 dir out \\
+              tmpl src \$LOCAL_IP dst ${T1OutsideVgw} proto esp reqid 1 mode tunnel mark 0x64 2>/dev/null || true
+            ip xfrm policy add src 0.0.0.0/0 dst 0.0.0.0/0 dir in \\
+              tmpl src ${T1OutsideVgw} dst \$LOCAL_IP proto esp reqid 1 mode tunnel mark 0x64 2>/dev/null || true
+            ip xfrm policy add src 0.0.0.0/0 dst 0.0.0.0/0 dir fwd \\
+              tmpl src ${T1OutsideVgw} dst \$LOCAL_IP proto esp reqid 1 mode tunnel mark 0x64 2>/dev/null || true
+
+            # xfrm policies for Tunnel2 (reqid 2 / mark 0xc8 = 200)
+            ip xfrm policy add src 0.0.0.0/0 dst 0.0.0.0/0 dir out \\
+              tmpl src \$LOCAL_IP dst ${T2OutsideVgw} proto esp reqid 2 mode tunnel mark 0xc8 2>/dev/null || true
+            ip xfrm policy add src 0.0.0.0/0 dst 0.0.0.0/0 dir in \\
+              tmpl src ${T2OutsideVgw} dst \$LOCAL_IP proto esp reqid 2 mode tunnel mark 0xc8 2>/dev/null || true
+            ip xfrm policy add src 0.0.0.0/0 dst 0.0.0.0/0 dir fwd \\
+              tmpl src ${T2OutsideVgw} dst \$LOCAL_IP proto esp reqid 2 mode tunnel mark 0xc8 2>/dev/null || true
+
+            # Blackhole routes so FRR advertises these prefixes via BGP
+            ip route replace blackhole ${BgpAnnounceCidr} metric 250
+            ip route replace blackhole ${OnPremInspectedCidr} metric 250
+
+            # More specific kernel routes to actually forward inspected
+            # subnet traffic into the on-prem VPC private subnet via the
+            # subnet's default gateway (overrides the blackhole above).
+            DEFGW=\$(ip -o -4 route show to default | awk '{print \$3}' | head -1)
+            DEFIF=\$(ip -o -4 route show to default | awk '{print \$5}' | head -1)
+            ip route replace ${OnPremInspectedCidr} via \$DEFGW dev \$DEFIF metric 50
+            EOF
+            chmod +x /usr/local/sbin/aws-vpn-vti.sh
+
+            cat >/etc/systemd/system/aws-vpn-vti.service <<'EOF'
+            [Unit]
+            Description=AWS VPN VTI bring-up
+            After=network-online.target strongswan-starter.service
+            Wants=network-online.target strongswan-starter.service
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/aws-vpn-vti.sh
+            RemainAfterExit=yes
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable aws-vpn-vti.service
+
+            # ==============================
+            # FRR - dual BGP neighbors (active/passive) over both tunnels,
+            # advertising the on-prem prefixes so AWS VGW propagates them.
+            #
+            # active/passive steering via BGP attributes:
+            #  - Egress CGW->AWS: Tunnel1 neighbor gets a higher 'weight'
+            #    (200 vs 100). Weight is Cisco-style, local to this router,
+            #    highest wins, so CGW sends toward AWS over Tunnel1.
+            #  - Ingress AWS->CGW: a route-map prepends our own ASN 3x on
+            #    routes advertised out Tunnel2. The longer AS_PATH makes the
+            #    AWS VGW prefer Tunnel1 for the return path. Tunnel2 is used
+            #    only when Tunnel1's BGP session drops.
+            # Both tunnels stay UP (auto=start on both conns) so the S2S
+            # VPN console reports 2/2 tunnels UP.
+            # ==============================
+            sed -i 's/^bgpd=no/bgpd=yes/' /etc/frr/daemons
+            cat >/etc/frr/frr.conf <<EOF
+            frr version 8.4
+            frr defaults traditional
+            hostname strongswan-cgw
+            no ipv6 forwarding
+            !
+            router bgp ${CustomerBgpAsnRef}
+             bgp router-id ${T1InsideCgw}
+             no bgp ebgp-requires-policy
+             neighbor ${T1InsideVgw} remote-as ${AwsVgwAsnRef}
+             neighbor ${T1InsideVgw} timers 10 30
+             neighbor ${T1InsideVgw} weight 200
+             neighbor ${T2InsideVgw} remote-as ${AwsVgwAsnRef}
+             neighbor ${T2InsideVgw} timers 10 30
+             neighbor ${T2InsideVgw} weight 100
+             !
+             address-family ipv4 unicast
+              network ${BgpAnnounceCidr}
+              network ${OnPremInspectedCidr}
+              neighbor ${T1InsideVgw} activate
+              neighbor ${T1InsideVgw} soft-reconfiguration inbound
+              neighbor ${T2InsideVgw} activate
+              neighbor ${T2InsideVgw} soft-reconfiguration inbound
+              neighbor ${T2InsideVgw} route-map STANDBY-OUT out
+             exit-address-family
+            !
+            ! Standby path: lengthen AS_PATH on Tunnel2 advertisements so
+            ! the AWS VGW prefers Tunnel1 for the return traffic.
+            route-map STANDBY-OUT permit 10
+             set as-path prepend ${CustomerBgpAsnRef} ${CustomerBgpAsnRef} ${CustomerBgpAsnRef}
+            !
+            line vty
+            !
+            EOF
+
+            systemctl enable strongswan-starter
+            systemctl restart strongswan-starter
+            sleep 5
+            systemctl start aws-vpn-vti.service || true
+            systemctl enable frr
+            systemctl restart frr
+
+            # Static safety-net routes (BGP will install more specific ones)
+            ip route replace ${InspectionVpcCidr} dev vti1 metric 100 || true
+
+            # ==============================
+            # xfrm policy reaper - install the route-based xfrm policies
+            # whenever they are missing. strongSwan re-keys SAs every
+            # hour and that wipes the kernel xfrm policy table; this
+            # keeps both route-based tunnels' data planes alive.
+            #   Tunnel1 -> reqid 1 / mark 0x64
+            #   Tunnel2 -> reqid 2 / mark 0xc8
+            # ==============================
+            cat >/usr/local/sbin/aws-vpn-xfrm-reinstall.sh <<EOF
+            #!/bin/bash
+            LOCAL_IF=\$(ip -o -4 route show to default | awk '{print \$5}' | head -1)
+            LOCAL_IP=\$(ip -o -4 addr show dev \$LOCAL_IF | awk '{print \$4}' | cut -d/ -f1)
+            REMOTE1=${T1OutsideVgw}
+            REMOTE2=${T2OutsideVgw}
+            if ! ip xfrm policy show | grep -q "mark 0x64"; then
+              ip xfrm policy add src 0.0.0.0/0 dst 0.0.0.0/0 dir out \\
+                tmpl src \$LOCAL_IP dst \$REMOTE1 proto esp reqid 1 mode tunnel mark 0x64 2>/dev/null || true
+              ip xfrm policy add src 0.0.0.0/0 dst 0.0.0.0/0 dir in \\
+                tmpl src \$REMOTE1 dst \$LOCAL_IP proto esp reqid 1 mode tunnel mark 0x64 2>/dev/null || true
+              ip xfrm policy add src 0.0.0.0/0 dst 0.0.0.0/0 dir fwd \\
+                tmpl src \$REMOTE1 dst \$LOCAL_IP proto esp reqid 1 mode tunnel mark 0x64 2>/dev/null || true
+              logger "aws-vpn: Tunnel1 xfrm policies (re)installed"
+            fi
+            if ! ip xfrm policy show | grep -q "mark 0xc8"; then
+              ip xfrm policy add src 0.0.0.0/0 dst 0.0.0.0/0 dir out \\
+                tmpl src \$LOCAL_IP dst \$REMOTE2 proto esp reqid 2 mode tunnel mark 0xc8 2>/dev/null || true
+              ip xfrm policy add src 0.0.0.0/0 dst 0.0.0.0/0 dir in \\
+                tmpl src \$REMOTE2 dst \$LOCAL_IP proto esp reqid 2 mode tunnel mark 0xc8 2>/dev/null || true
+              ip xfrm policy add src 0.0.0.0/0 dst 0.0.0.0/0 dir fwd \\
+                tmpl src \$REMOTE2 dst \$LOCAL_IP proto esp reqid 2 mode tunnel mark 0xc8 2>/dev/null || true
+              logger "aws-vpn: Tunnel2 xfrm policies (re)installed"
+            fi
+            EOF
+            chmod +x /usr/local/sbin/aws-vpn-xfrm-reinstall.sh
+
+            cat >/etc/systemd/system/aws-vpn-xfrm-reinstall.service <<'EOF'
+            [Unit]
+            Description=Re-install AWS VPN route-based xfrm policies if missing
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/aws-vpn-xfrm-reinstall.sh
+            EOF
+
+            cat >/etc/systemd/system/aws-vpn-xfrm-reinstall.timer <<'EOF'
+            [Unit]
+            Description=Periodically check AWS VPN xfrm policies
+            [Timer]
+            OnBootSec=30s
+            OnUnitActiveSec=60s
+            Unit=aws-vpn-xfrm-reinstall.service
+            [Install]
+            WantedBy=timers.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now aws-vpn-xfrm-reinstall.timer
+
+            # Give BGP a moment then nudge both sessions so advertised
+            # routes are recomputed against the freshly-installed
+            # blackhole kernel routes.
+            sleep 15
+            vtysh -c "clear ip bgp ${T1InsideVgw} soft out" || true
+            vtysh -c "clear ip bgp ${T2InsideVgw} soft out" || true
+
+            echo "strongSwan + FRR bootstrap finished" > /var/log/cgw-bootstrap.done
+          - StrongSwanEIPRef: !Ref StrongSwanEIP
+            T1OutsideVgw: !GetAtt VPNInfoResolver.Tunnel1OutsideVgw
+            T1InsideCgw: !GetAtt VPNInfoResolver.Tunnel1InsideCgw
+            T1InsideVgw: !GetAtt VPNInfoResolver.Tunnel1InsideVgw
+            T1Psk: !Ref Tunnel1PreSharedKey
+            T2OutsideVgw: !GetAtt VPNInfoResolver.Tunnel2OutsideVgw
+            T2InsideCgw: !GetAtt VPNInfoResolver.Tunnel2InsideCgw
+            T2InsideVgw: !GetAtt VPNInfoResolver.Tunnel2InsideVgw
+            T2Psk: !Ref Tunnel2PreSharedKey
+            CustomerBgpAsnRef: !Ref CustomerBgpAsn
+            AwsVgwAsnRef: !Ref AwsVgwBgpAsn
+            BgpAnnounceCidr: !FindInMap [Cidr, OnPremVpc, BgpAnnounce]
+            OnPremInspectedCidr: !FindInMap [Cidr, OnPremVpc, PrivateSubnet]
+            InspectionVpcCidr: !FindInMap [Cidr, InspectionVpc, Vpc]
+
+
+  # ============================================================
+  # Workload EC2 instances - inspection VPC (private subnets)
+  #
+  # Each instance gets:
+  #   1) A Python http.server serving /var/www/index.html on :80,
+  #      labelled with its role so curl from elsewhere identifies
+  #      which EC2 answered.
+  #   2) Passwordless SSH mesh: a one-shot RSA keypair generated
+  #      by SshMeshKeyGen is written to /home/ubuntu/.ssh, and
+  #      ssh_config disables strict host key checking on the
+  #      private 10/8 ranges so 'ssh ubuntu@<peer-ip>' just works.
+  #   3) Best-effort apt + snap installs of mtr/iperf3/tcpdump
+  #      and amazon-ssm-agent. These depend on internet egress
+  #      (which only works after VPN/BGP is up and StrongSwan
+  #      SNAT is in place) so they are wrapped in '|| true'.
+  # ============================================================
+  WorkloadInspectionAZ1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t4g.micro
+      ImageId: !Ref LatestUbuntuArmAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PrivateSubnetAZ1
+      IamInstanceProfile: !Ref EC2SSMInstanceProfile
+      SecurityGroupIds:
+        - !Ref WorkloadSGInspection
+      Tags:
+        - Key: Name
+          Value: Workload AZ1 (inspection)
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -eux
+            export DEBIAN_FRONTEND=noninteractive
+
+            # === SSH mesh: passwordless SSH between workload EC2s ===
+            mkdir -p /home/ubuntu/.ssh
+            cat >/home/ubuntu/.ssh/id_rsa <<'PRIV_EOF'
+            ${SshPrivateKey}
+            PRIV_EOF
+            cat >/home/ubuntu/.ssh/id_rsa.pub <<'PUB_EOF'
+            ${SshPublicKey}
+            PUB_EOF
+            touch /home/ubuntu/.ssh/authorized_keys
+            grep -qxF "${SshPublicKey}" /home/ubuntu/.ssh/authorized_keys \
+              || cat /home/ubuntu/.ssh/id_rsa.pub >> /home/ubuntu/.ssh/authorized_keys
+            cat >/home/ubuntu/.ssh/config <<'CFG_EOF'
+            Host 10.87.* 10.132.* 10.0.*
+                User ubuntu
+                IdentityFile ~/.ssh/id_rsa
+                StrictHostKeyChecking no
+                UserKnownHostsFile /dev/null
+            CFG_EOF
+            chmod 700 /home/ubuntu/.ssh
+            chmod 600 /home/ubuntu/.ssh/id_rsa /home/ubuntu/.ssh/authorized_keys /home/ubuntu/.ssh/config
+            chmod 644 /home/ubuntu/.ssh/id_rsa.pub
+            chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+
+            # === Web service: Python http.server on :80 ===
+            mkdir -p /var/www
+            PRIMARY_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+            PRIVATE_IP=$(ip -o -4 addr show dev "${!PRIMARY_IF}" | awk '{print $4}' | cut -d/ -f1)
+            HOSTNAME_VAL=$(hostname)
+            cat >/var/www/index.html <<HTML
+            <!doctype html>
+            <html><head><meta charset="utf-8"><title>${ServerLabel}</title></head>
+            <body style="font-family:sans-serif;">
+            <h1>This is ${ServerLabel}</h1>
+            <p><b>Role:</b> ${ServerRole}</p>
+            <p><b>Hostname:</b> ${!HOSTNAME_VAL}</p>
+            <p><b>Private IP:</b> ${!PRIVATE_IP}</p>
+            </body></html>
+            HTML
+
+            cat >/etc/systemd/system/workload-http.service <<'SVC_EOF'
+            [Unit]
+            Description=Workload HTTP server (Python http.server on :80)
+            After=network-online.target
+            [Service]
+            ExecStart=/usr/bin/python3 -m http.server 80 --directory /var/www
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            SVC_EOF
+            systemctl daemon-reload
+            systemctl enable --now workload-http.service
+
+            # === Best-effort tooling install (needs VPN + SNAT egress) ===
+            (apt-get update && apt-get install -y mtr-tiny iperf3 tcpdump traceroute net-tools dnsutils) || true
+            snap install amazon-ssm-agent --classic || true
+            systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service \
+              || systemctl enable --now amazon-ssm-agent || true
+
+            cat >/etc/systemd/system/iperf3-server.service <<'IPS_EOF'
+            [Unit]
+            Description=iperf3 server
+            After=network-online.target
+            [Service]
+            ExecStart=/usr/bin/iperf3 -s
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            IPS_EOF
+            systemctl daemon-reload
+            systemctl enable iperf3-server || true
+            systemctl start iperf3-server || true
+          - SshPrivateKey: !GetAtt SshMeshKeyGen.PrivateKey
+            SshPublicKey: !GetAtt SshMeshKeyGen.PublicKey
+            ServerLabel: 'Workload AZ1 server'
+            ServerRole: 'inspection VPC, AZ1 (10.87.114.0/24)'
+
+  WorkloadInspectionAZ2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t4g.micro
+      ImageId: !Ref LatestUbuntuArmAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PrivateSubnetAZ2
+      IamInstanceProfile: !Ref EC2SSMInstanceProfile
+      SecurityGroupIds:
+        - !Ref WorkloadSGInspection
+      Tags:
+        - Key: Name
+          Value: Workload AZ2 (inspection)
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -eux
+            export DEBIAN_FRONTEND=noninteractive
+
+            # === SSH mesh: passwordless SSH between workload EC2s ===
+            mkdir -p /home/ubuntu/.ssh
+            cat >/home/ubuntu/.ssh/id_rsa <<'PRIV_EOF'
+            ${SshPrivateKey}
+            PRIV_EOF
+            cat >/home/ubuntu/.ssh/id_rsa.pub <<'PUB_EOF'
+            ${SshPublicKey}
+            PUB_EOF
+            touch /home/ubuntu/.ssh/authorized_keys
+            grep -qxF "${SshPublicKey}" /home/ubuntu/.ssh/authorized_keys \
+              || cat /home/ubuntu/.ssh/id_rsa.pub >> /home/ubuntu/.ssh/authorized_keys
+            cat >/home/ubuntu/.ssh/config <<'CFG_EOF'
+            Host 10.87.* 10.132.* 10.0.*
+                User ubuntu
+                IdentityFile ~/.ssh/id_rsa
+                StrictHostKeyChecking no
+                UserKnownHostsFile /dev/null
+            CFG_EOF
+            chmod 700 /home/ubuntu/.ssh
+            chmod 600 /home/ubuntu/.ssh/id_rsa /home/ubuntu/.ssh/authorized_keys /home/ubuntu/.ssh/config
+            chmod 644 /home/ubuntu/.ssh/id_rsa.pub
+            chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+
+            # === Web service: Python http.server on :80 ===
+            mkdir -p /var/www
+            PRIMARY_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+            PRIVATE_IP=$(ip -o -4 addr show dev "${!PRIMARY_IF}" | awk '{print $4}' | cut -d/ -f1)
+            HOSTNAME_VAL=$(hostname)
+            cat >/var/www/index.html <<HTML
+            <!doctype html>
+            <html><head><meta charset="utf-8"><title>${ServerLabel}</title></head>
+            <body style="font-family:sans-serif;">
+            <h1>This is ${ServerLabel}</h1>
+            <p><b>Role:</b> ${ServerRole}</p>
+            <p><b>Hostname:</b> ${!HOSTNAME_VAL}</p>
+            <p><b>Private IP:</b> ${!PRIVATE_IP}</p>
+            </body></html>
+            HTML
+
+            cat >/etc/systemd/system/workload-http.service <<'SVC_EOF'
+            [Unit]
+            Description=Workload HTTP server (Python http.server on :80)
+            After=network-online.target
+            [Service]
+            ExecStart=/usr/bin/python3 -m http.server 80 --directory /var/www
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            SVC_EOF
+            systemctl daemon-reload
+            systemctl enable --now workload-http.service
+
+            # === Best-effort tooling install (needs VPN + SNAT egress) ===
+            (apt-get update && apt-get install -y mtr-tiny iperf3 tcpdump traceroute net-tools dnsutils) || true
+            snap install amazon-ssm-agent --classic || true
+            systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service \
+              || systemctl enable --now amazon-ssm-agent || true
+
+            cat >/etc/systemd/system/iperf3-server.service <<'IPS_EOF'
+            [Unit]
+            Description=iperf3 server
+            After=network-online.target
+            [Service]
+            ExecStart=/usr/bin/iperf3 -s
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            IPS_EOF
+            systemctl daemon-reload
+            systemctl enable iperf3-server || true
+            systemctl start iperf3-server || true
+          - SshPrivateKey: !GetAtt SshMeshKeyGen.PrivateKey
+            SshPublicKey: !GetAtt SshMeshKeyGen.PublicKey
+            ServerLabel: 'Workload AZ2 server'
+            ServerRole: 'inspection VPC, AZ2 (10.87.113.0/24)'
+
+  # ============================================================
+  # Workload EC2 instance - simulated on-prem (private subnet)
+  #
+  # Same Web + SSH-mesh + best-effort tooling as the inspection
+  # AZ workloads. Egress to the internet here goes:
+  #   10.132.66.x -> StrongSwan ENI (per OnPremPrivateRT) ->
+  #                  StrongSwan SNAT -> IGW -> internet.
+  # That path needs StrongSwan UserData to finish first; the
+  # Web and SSH mesh do NOT depend on it.
+  # ============================================================
+  WorkloadOnPrem:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t4g.micro
+      ImageId: !Ref LatestUbuntuArmAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref OnPremPrivateSubnet
+      IamInstanceProfile: !Ref EC2SSMInstanceProfile
+      SecurityGroupIds:
+        - !Ref WorkloadSGOnPrem
+      Tags:
+        - Key: Name
+          Value: Workload (simulated onprem)
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -eux
+            export DEBIAN_FRONTEND=noninteractive
+
+            # === SSH mesh: passwordless SSH between workload EC2s ===
+            mkdir -p /home/ubuntu/.ssh
+            cat >/home/ubuntu/.ssh/id_rsa <<'PRIV_EOF'
+            ${SshPrivateKey}
+            PRIV_EOF
+            cat >/home/ubuntu/.ssh/id_rsa.pub <<'PUB_EOF'
+            ${SshPublicKey}
+            PUB_EOF
+            touch /home/ubuntu/.ssh/authorized_keys
+            grep -qxF "${SshPublicKey}" /home/ubuntu/.ssh/authorized_keys \
+              || cat /home/ubuntu/.ssh/id_rsa.pub >> /home/ubuntu/.ssh/authorized_keys
+            cat >/home/ubuntu/.ssh/config <<'CFG_EOF'
+            Host 10.87.* 10.132.* 10.0.*
+                User ubuntu
+                IdentityFile ~/.ssh/id_rsa
+                StrictHostKeyChecking no
+                UserKnownHostsFile /dev/null
+            CFG_EOF
+            chmod 700 /home/ubuntu/.ssh
+            chmod 600 /home/ubuntu/.ssh/id_rsa /home/ubuntu/.ssh/authorized_keys /home/ubuntu/.ssh/config
+            chmod 644 /home/ubuntu/.ssh/id_rsa.pub
+            chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+
+            # === Web service: Python http.server on :80 ===
+            mkdir -p /var/www
+            PRIMARY_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+            PRIVATE_IP=$(ip -o -4 addr show dev "${!PRIMARY_IF}" | awk '{print $4}' | cut -d/ -f1)
+            HOSTNAME_VAL=$(hostname)
+            cat >/var/www/index.html <<HTML
+            <!doctype html>
+            <html><head><meta charset="utf-8"><title>${ServerLabel}</title></head>
+            <body style="font-family:sans-serif;">
+            <h1>This is ${ServerLabel}</h1>
+            <p><b>Role:</b> ${ServerRole}</p>
+            <p><b>Hostname:</b> ${!HOSTNAME_VAL}</p>
+            <p><b>Private IP:</b> ${!PRIVATE_IP}</p>
+            </body></html>
+            HTML
+
+            cat >/etc/systemd/system/workload-http.service <<'SVC_EOF'
+            [Unit]
+            Description=Workload HTTP server (Python http.server on :80)
+            After=network-online.target
+            [Service]
+            ExecStart=/usr/bin/python3 -m http.server 80 --directory /var/www
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            SVC_EOF
+            systemctl daemon-reload
+            systemctl enable --now workload-http.service
+
+            # === Best-effort tooling install (needs VPN + SNAT egress) ===
+            (apt-get update && apt-get install -y mtr-tiny iperf3 tcpdump traceroute net-tools dnsutils) || true
+            snap install amazon-ssm-agent --classic || true
+            systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service \
+              || systemctl enable --now amazon-ssm-agent || true
+
+            cat >/etc/systemd/system/iperf3-server.service <<'IPS_EOF'
+            [Unit]
+            Description=iperf3 server
+            After=network-online.target
+            [Service]
+            ExecStart=/usr/bin/iperf3 -s
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            IPS_EOF
+            systemctl daemon-reload
+            systemctl enable iperf3-server || true
+            systemctl start iperf3-server || true
+          - SshPrivateKey: !GetAtt SshMeshKeyGen.PrivateKey
+            SshPublicKey: !GetAtt SshMeshKeyGen.PublicKey
+            ServerLabel: 'Workload OnPrem server'
+            ServerRole: 'simulated IDC, 10.132.66.0/24'
+
+Outputs:
+  InspectionVPCId:
+    Description: Inspection VPC ID
+    Value: !Ref InspectionVPC
+
+  InspectionVpcCidr:
+    Description: Inspection VPC CIDR
+    Value: !FindInMap [Cidr, InspectionVpc, Vpc]
+
+  OnPremVPCId:
+    Description: Simulated on-prem VPC ID
+    Value: !Ref OnPremVPC
+
+  OnPremVpcCidr:
+    Description: Simulated on-prem VPC CIDR
+    Value: !FindInMap [Cidr, OnPremVpc, Vpc]
+
+  OnPremPrivateSubnetCidr:
+    Description: On-prem workload subnet (advertised by BGP)
+    Value: !FindInMap [Cidr, OnPremVpc, PrivateSubnet]
+
+  VGWId:
+    Description: Virtual Private Gateway ID
+    Value: !Ref VGW
+
+  VPNConnectionId:
+    Description: Site-to-Site VPN connection ID (DX simulator)
+    Value: !Ref VPNConnection
+
+  CustomerGatewayId:
+    Description: Customer Gateway ID (points at strongSwan EIP)
+    Value: !Ref CustomerGateway
+
+  StrongSwanEIP:
+    Description: Public IP of the strongSwan + FRR Customer Gateway
+    Value: !Ref StrongSwanEIP
+
+  StrongSwanInstanceId:
+    Description: EC2 ID of the strongSwan + FRR Customer Gateway
+    Value: !Ref StrongSwanInstance
+
+  NFWFirewallArn:
+    Description: Network Firewall ARN
+    Value: !Ref NFWFirewall
+
+  NFWEndpointAZ1:
+    Description: NFW VPC endpoint in AZ1
+    Value: !GetAtt NFWEndpointResolver.EndpointIdAZ1
+
+  NFWEndpointAZ2:
+    Description: NFW VPC endpoint in AZ2
+    Value: !GetAtt NFWEndpointResolver.EndpointIdAZ2
+
+  InspectionIGWId:
+    Description: Inspection VPC Internet Gateway ID (new NAT-egress path)
+    Value: !Ref InspectionIGW
+
+  NatGatewayAZ1Id:
+    Description: NAT Gateway in AZ1 (egress after NFW inspection)
+    Value: !Ref NatGatewayAZ1
+
+  NatGatewayAZ2Id:
+    Description: NAT Gateway in AZ2 (egress after NFW inspection)
+    Value: !Ref NatGatewayAZ2
+
+  NatEIPAZ1Address:
+    Description: Public egress IP (EIP) of NAT Gateway AZ1
+    Value: !Ref NatEIPAZ1
+
+  NatEIPAZ2Address:
+    Description: Public egress IP (EIP) of NAT Gateway AZ2
+    Value: !Ref NatEIPAZ2
+
+  Tunnel1OutsideVgwIp:
+    Description: AWS-side public IP of VPN tunnel 1
+    Value: !GetAtt VPNInfoResolver.Tunnel1OutsideVgw
+
+  Tunnel2OutsideVgwIp:
+    Description: AWS-side public IP of VPN tunnel 2
+    Value: !GetAtt VPNInfoResolver.Tunnel2OutsideVgw
+
+  Tunnel1InsideCgwIp:
+    Description: CGW-side inside IP for tunnel 1 (BGP local)
+    Value: !GetAtt VPNInfoResolver.Tunnel1InsideCgw
+
+  Tunnel1InsideVgwIp:
+    Description: VGW-side inside IP for tunnel 1 (BGP peer)
+    Value: !GetAtt VPNInfoResolver.Tunnel1InsideVgw
+
+  Tunnel2InsideCgwIp:
+    Description: CGW-side inside IP for tunnel 2
+    Value: !GetAtt VPNInfoResolver.Tunnel2InsideCgw
+
+  Tunnel2InsideVgwIp:
+    Description: VGW-side inside IP for tunnel 2
+    Value: !GetAtt VPNInfoResolver.Tunnel2InsideVgw
+
+  WorkloadInspectionAZ1Id:
+    Description: Inspection-VPC workload EC2 in AZ1
+    Value: !Ref WorkloadInspectionAZ1
+
+  WorkloadInspectionAZ2Id:
+    Description: Inspection-VPC workload EC2 in AZ2
+    Value: !Ref WorkloadInspectionAZ2
+
+  WorkloadOnPremId:
+    Description: Simulated on-prem workload EC2
+    Value: !Ref WorkloadOnPrem
+
+  EICEndpointInspectionId:
+    Description: EIC endpoint in inspection VPC
+    Value: !Ref EICEndpointInspection
+
+  EICEndpointOnPremId:
+    Description: EIC endpoint in on-prem VPC
+    Value: !Ref EICEndpointOnPrem
