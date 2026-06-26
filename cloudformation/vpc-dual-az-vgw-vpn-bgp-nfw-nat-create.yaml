@@ -467,7 +467,25 @@ Resources:
 
 
   # ============================================================
-  # Network Firewall - Stateful rule group (temporary allow-all for debug)
+  # Network Firewall - Stateful rule group (allow rest of traffic)
+  #
+  # IMPORTANT: this is NOT a flat "pass ip any any -> any any" rule.
+  # A broad "pass ip" matches the TCP SYN (the first packet of a
+  # flow); per Suricata semantics, once a pass rule matches any
+  # packet in a flow, the rest of the flow is passed WITHOUT further
+  # inspection. That short-circuits application-layer drop rules
+  # (http.host / tls.sni), so domain-based egress blocking would
+  # never fire. (Port-based drops like block-idc-http still work
+  # because they match at L4 on the SYN.)
+  #
+  # To allow "everything else" while still letting the app-layer
+  # google.com drop (priority 2) take effect, we pass:
+  #   - TCP only once it is established and client->server, i.e. on
+  #     the request/ClientHello packet, which is evaluated AFTER the
+  #     domain drop in STRICT_ORDER. The TCP handshake itself is
+  #     permitted by the policy default action aws:drop_established.
+  #   - UDP and ICMP directly (no application-layer inspection needed).
+  # Return (server->client) traffic is permitted by drop_established.
   # ============================================================
   NFWStatefulAllowAll:
     Type: AWS::NetworkFirewall::RuleGroup
@@ -475,28 +493,18 @@ Resources:
       RuleGroupName: !Sub '${AWS::StackName}-allow-all-debug'
       Type: STATEFUL
       Capacity: 10
-      Description: Temporary stateful rule group passing all traffic in either direction
+      Description: Pass established TCP (client->server), UDP and ICMP so app-layer drops still evaluate
       RuleGroup:
         RulesSource:
-          StatefulRules:
-            - Action: PASS
-              Header:
-                Protocol: IP
-                Source: ANY
-                SourcePort: ANY
-                Destination: ANY
-                DestinationPort: ANY
-                Direction: ANY
-              RuleOptions:
-                - Keyword: 'sid'
-                  Settings: ['1000001']
-                - Keyword: 'rev'
-                  Settings: ['1']
+          RulesString: |
+            pass tcp any any -> any any (flow:established,to_server; sid:1000001; rev:1;)
+            pass udp any any -> any any (sid:1000002; rev:1;)
+            pass icmp any any -> any any (sid:1000003; rev:1;)
         StatefulRuleOptions:
           RuleOrder: STRICT_ORDER
       Tags:
         - Key: Name
-          Value: Stateful allow-all debug rule group
+          Value: Stateful allow-rest rule group
 
   # ============================================================
   # Network Firewall - Stateful rule group (block IDC -> cloud EC2 HTTP/80)
@@ -562,8 +570,8 @@ Resources:
       RuleGroup:
         RulesSource:
           RulesString: |
-            drop http any any -> any any (msg:"Block egress HTTP to google.com"; flow:to_server; http.host; content:"google.com"; nocase; endswith; sid:1000020; rev:1;)
-            drop tls any any -> any any (msg:"Block egress TLS to google.com"; flow:to_server; tls.sni; content:"google.com"; nocase; endswith; sid:1000021; rev:1;)
+            drop http any any -> any any (msg:"Block egress HTTP to google.com"; flow:to_server; http.host; content:"google.com"; endswith; sid:1000020; rev:1;)
+            drop tls any any -> any any (msg:"Block egress TLS to google.com"; flow:to_server; tls.sni; content:"google.com"; endswith; sid:1000021; rev:1;)
         StatefulRuleOptions:
           RuleOrder: STRICT_ORDER
       Tags:

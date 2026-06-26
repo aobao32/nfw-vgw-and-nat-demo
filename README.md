@@ -157,7 +157,9 @@ aws cloudformation create-stack \
 - NFW 策略采用严格顺序（STRICT_ORDER），规则优先级为：
   - 优先级 1：`block-idc-http`，丢弃 IDC → 云端业务子网 TCP/80（继承自原方案）
   - 优先级 2：`block-egress-domain`，丢弃云端去往特定域名的 HTTP/HTTPS 出站（本方案新增，用于演示出站检测）
-  - 优先级 100：`allow-all`，放行其余所有流量
+  - 优先级 100：`allow-all`，放行其余流量（放行已建立的 TCP「客户端→服务器」方向、以及 UDP、ICMP）
+
+> 关于优先级 100 规则的写法：这里**不能**用一条 `pass ip any any -> any any`。因为按 Suricata 语义，`pass` 规则只要匹配到流中任意一个包（TCP 的 SYN 包就会被它匹配），该流后续的包就会被直接放行、不再检查，这会导致依赖应用层数据的域名拦截（http.host / tls.sni，要等 HTTP/TLS 数据包才出现）永远没机会生效。因此改为：TCP 仅在「已建立 + 客户端→服务器」时放行（此时域名 drop 已按优先级先评估过），UDP/ICMP 直接放行；TCP 握手包由策略默认动作 `aws:drop_established` 放行，返回方向（服务器→客户端）也由该默认动作放行。基于端口的 `block-idc-http` 不受影响，因为它在 SYN 包的 L4 层即可匹配。
 - 日志已开启，发送到 CloudWatch Logs 的 `flow` 与 `alert` 两个日志组
 
 > 注意：CloudFormation 显示绿色后，VPN 隧道与 BGP 会话可能还需要再等 5-10 分钟才完全建立。出站互联网检测不依赖 VPN/BGP，可立即验证；IDC 东西向相关验证需等待 BGP 收敛。
