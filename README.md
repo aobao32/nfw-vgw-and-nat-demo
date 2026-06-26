@@ -159,7 +159,7 @@ aws cloudformation create-stack \
   - 优先级 2：`block-egress-domain`，丢弃云端去往特定域名的 HTTP/HTTPS 出站（本方案新增，用于演示出站检测）
   - 优先级 100：`allow-all`，放行其余流量（放行已建立的 TCP「客户端→服务器」方向、以及 UDP、ICMP）
 
-> 关于优先级 100 规则的写法：这里**不能**用一条 `pass ip any any -> any any`。因为按 Suricata 语义，`pass` 规则只要匹配到流中任意一个包（TCP 的 SYN 包就会被它匹配），该流后续的包就会被直接放行、不再检查，这会导致依赖应用层数据的域名拦截（http.host / tls.sni，要等 HTTP/TLS 数据包才出现）永远没机会生效。因此改为：TCP 仅在「已建立 + 客户端→服务器」时放行（此时域名 drop 已按优先级先评估过），UDP/ICMP 直接放行；TCP 握手包由策略默认动作 `aws:drop_established` 放行，返回方向（服务器→客户端）也由该默认动作放行。基于端口的 `block-idc-http` 不受影响，因为它在 SYN 包的 L4 层即可匹配。
+> 关于优先级 100 规则的写法：这里**不能**用一条 `pass ip any any -> any any`。因为按 Suricata 语义，`pass` 规则只要匹配到流中任意一个包（TCP 的 SYN 包就会被它匹配），该流后续的包就会被直接放行、不再检查，这会导致依赖应用层数据的域名拦截（http.host / tls.sni，要等 HTTP/TLS 数据包才出现）永远没机会生效。因此改为：TCP 仅在「已建立 + 客户端→服务器」时放行（此时域名 drop 已按优先级先评估过），UDP/ICMP 直接放行；TCP 握手包由策略默认动作 `aws:drop_established_app_layer_to_server` 放行，返回方向（服务器→客户端）也由该默认动作放行。基于端口的 `block-idc-http` 不受影响，因为它在 SYN 包的 L4 层即可匹配。
 - 日志已开启，发送到 CloudWatch Logs 的 `flow` 与 `alert` 两个日志组
 
 > 注意：CloudFormation 显示绿色后，VPN 隧道与 BGP 会话可能还需要再等 5-10 分钟才完全建立。出站互联网检测不依赖 VPN/BGP，可立即验证；IDC 东西向相关验证需等待 BGP 收敛。
@@ -278,7 +278,9 @@ pass udp any any -> any any (sid:1000002; rev:1;)
 pass icmp any any -> any any (sid:1000003; rev:1;)
 
 # 策略默认动作
-aws:drop_established   # 放行三/四层握手包，丢弃已建立连接里没被任何 pass 命中的 client->server 数据包
+aws:drop_established_app_layer_to_server   # Application drop established (server-directed only)
+                                           # 放行三/四层握手包与返回方向，丢弃已建立连接里没被任何 pass 命中的 client->server 数据包
+                                           # 并对分段的 TLS ClientHello / HTTP 请求做应用层感知处理
 ```
 
 再走一遍 `google.com`：
@@ -287,7 +289,7 @@ aws:drop_established   # 放行三/四层握手包，丢弃已建立连接里没
 
 - 优先级 1 / 2：不匹配
 - 优先级 100 `pass tcp ... flow:established,to_server`：连接还没 established → 不匹配
-- 没有规则命中 → 交给默认动作 `drop_established`：这是握手包 → 放行（连接得以建立）
+- 没有规则命中 → 交给默认动作 `aws:drop_established_app_layer_to_server`：这是握手包 → 放行（连接得以建立）
 
 #### (2) HTTP GET 包（已 established、client→server、带 `Host: google.com`）
 
@@ -297,13 +299,15 @@ aws:drop_established   # 放行三/四层握手包，丢弃已建立连接里没
 
 换成访问 `aws.amazon.com`，同样这个数据包：优先级 2 不匹配（不是 google），优先级 100 `pass tcp` 匹配 → 放行。其他域名正常出网。
 
-**核心变化**：把 pass 从「SYN 包就能命中」挪到「应用层数据包才命中」。这样域名 drop（优先级 2）和兜底 pass（优先级 100）落在**同一个数据包**上比较，strict order 的优先级才真正起作用——小号的 drop 先生效；握手阶段的放行交给 `drop_established` 默认动作，而不是一条会「整流放行」的 `pass ip`。
+**核心变化**：把 pass 从「SYN 包就能命中」挪到「应用层数据包才命中」。这样域名 drop（优先级 2）和兜底 pass（优先级 100）落在**同一个数据包**上比较，strict order 的优先级才真正起作用——小号的 drop 先生效；握手阶段的放行交给 `aws:drop_established_app_layer_to_server` 默认动作，而不是一条会「整流放行」的 `pass ip`。
 
 ### 7、小结
 
 - strict order 的优先级，只在「多条规则都能匹配当前这个包」时才决定胜负。
 - 应用层规则（域名）只能在数据包阶段匹配，碰上一条在 SYN 阶段就 `pass` 的规则，会被「整条流放行」提前短路。
-- 解决办法：别让任何 `pass` 规则在 SYN 阶段命中（用 `flow:established,to_server` 限定），握手交给 `aws:drop_established`，让域名 drop 和兜底 pass 在同一个应用层数据包上按优先级公平较量。
+- 解决办法：别让任何 `pass` 规则在 SYN 阶段命中（用 `flow:established,to_server` 限定），握手交给 `aws:drop_established_app_layer_to_server`，让域名 drop 和兜底 pass 在同一个应用层数据包上按优先级公平较量。
+
+> 关于默认动作的选择：本方案的默认动作用的是 `aws:drop_established_app_layer_to_server`，即控制台里的 **Application drop established (server-directed only)**（也是 AWS 自 2026-06 起新建策略的默认值）。相比包级别的 `aws:drop_established`，它是**应用层感知**的：会先放行分段的 TLS ClientHello / HTTP 请求包，直到解析出 `TLS.SNI` / `HTTP.HOST` 再按规则判定，并且只丢「客户端→服务器」方向、放行服务器返回流量。对本方案这种 7 层域名过滤场景更稳妥。
 
 ## 五、清理环境
 

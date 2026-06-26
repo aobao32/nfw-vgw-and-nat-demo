@@ -483,9 +483,9 @@ Resources:
   #   - TCP only once it is established and client->server, i.e. on
   #     the request/ClientHello packet, which is evaluated AFTER the
   #     domain drop in STRICT_ORDER. The TCP handshake itself is
-  #     permitted by the policy default action aws:drop_established.
+  #     permitted by the policy default action (aws:drop_established_app_layer_to_server).
   #   - UDP and ICMP directly (no application-layer inspection needed).
-  # Return (server->client) traffic is permitted by drop_established.
+  # Return (server->client) traffic is permitted by the default action too.
   # ============================================================
   NFWStatefulAllowAll:
     Type: AWS::NetworkFirewall::RuleGroup
@@ -599,7 +599,16 @@ Resources:
           - ResourceArn: !Ref NFWStatefulAllowAll
             Priority: 100
         StatefulDefaultActions:
-          - 'aws:drop_established'
+          # aws:drop_established_app_layer_to_server = console "Application drop
+          # established (server-directed only)". Application-layer aware default
+          # drop that only drops client->server packets of established connections
+          # not matched by a pass rule, while allowing server->client return
+          # traffic, server banners and TCP control packets. It also allows
+          # segmented TLS ClientHello / HTTP request packets until TLS.SNI /
+          # HTTP.HOST is parsed, then applies rules - which is exactly what makes
+          # domain (L7) egress filtering reliable. This is also the AWS default
+          # for newly created policies since 2026-06.
+          - 'aws:drop_established_app_layer_to_server'
         StatefulEngineOptions:
           RuleOrder: STRICT_ORDER
           StreamExceptionPolicy: DROP
