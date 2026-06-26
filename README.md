@@ -210,11 +210,106 @@ curl -s --max-time 10 https://checkip.amazonaws.com
 
 完成以上验证，即可确认 NFW 正确检测并按策略拦截了云上 EC2 的出站互联网流量。
 
-## 四、清理环境
+## 四、NFW 检测 7 层域名时候的规则配置
+
+本节解释一个容易踩的坑：在 strict order（严格顺序）下，用应用层关键字（`http.host` / `tls.sni`）做域名拦截时，为什么一条优先级数字更小的域名 drop 规则可能"不生效"，而优先级数字更大的 allow 规则却把流量放行了。本方案最初就遇到过：访问 `google.com` 没有被拦截，反而拿到了 301。
+
+### 1、先厘清 strict order 的优先级到底管什么
+
+strict order 是按优先级数字从小到大评估，这点没错。但有一个关键前提常被忽略：**评估是「逐包」进行的，优先级只在「同一个包上，多条规则都能匹配」时才决定谁先生效**。如果某条规则在当前这个包上根本无法匹配，那么它的优先级再小也轮不到它。
+
+### 2、关键前提：一条连接是多个包，规则逐包匹配
+
+一条 TCP 连接不是一个包，而是一连串包：
+
+```
+客户端                          服务器
+  | --- SYN ------------------> |   ← 第 1 个包（三次握手开始）
+  | <-- SYN-ACK --------------- |
+  | --- ACK ------------------> |
+  | --- HTTP GET (Host: ...) -> |   ← 这里才第一次出现应用层数据
+  | <-- HTTP 响应 ------------- |
+```
+
+`http.host` / `tls.sni` 这类**应用层关键字**，必须等到带 HTTP/TLS 数据的那个包到达、引擎解析出协议内容后才能匹配。**在 SYN 包上，它们无法匹配**——那时 HTTP/TLS 还没开始。
+
+### 3、再加一个 Suricata 语义：pass 会「整条流放行」
+
+AWS 官方文档明确指出：如果流中某个包匹配了带 `pass` 动作的规则，Suricata 就不再扫描该流的其余包，直接放行这些未扫描的包。
+
+也就是说，`pass` 一旦在**任意一个包**上命中，整条连接后续的包都被放行、不再过规则。这是「流级别放行」，不是「单包放行」。
+
+### 4、逐包推演：为什么旧配置拦不住域名
+
+旧的三条规则（strict order，优先级 1 / 2 / 100）：
+
+```
+优先级 1   : drop tcp [IDC] any -> [云端子网] 80   (block-idc-http，端口规则)
+优先级 2   : drop http/tls ... google.com           (域名规则，应用层)
+优先级 100 : pass ip any any -> any any             (allow-all，三/四层)
+```
+
+EC2 访问 `google.com`，逐包推演：
+
+#### (1) SYN 包（去 google:80，还没有 HTTP 数据）
+
+- 优先级 1：源不是 IDC，不匹配
+- 优先级 2：`http.host` 此刻无法匹配（还没 HTTP 数据）→ 跳过
+- 优先级 100：`pass ip any any` → **匹配！** → 放行，并按上面的语义，**整条流后续包都不再扫描**
+
+#### (2) HTTP GET 包（带 `Host: google.com`）
+
+- 这个包本来能被优先级 2 的域名 drop 命中——但因为 SYN 已触发整条流放行，**它根本不会再进规则引擎**。
+
+结论：问题不是「优先级 100 比优先级 2 高」，而是 **优先级 100 在 SYN 包上抢先命中并放行了整条流，让优先级 2 永远等不到它能匹配的那个数据包**。
+
+### 5、对比：为什么端口规则 block-idc-http 能拦住
+
+`drop tcp ... 80` 是**端口规则**，端口信息在**每一个包里都有**，包括 SYN。所以 IDC→云端的 80 流量，在 SYN 包上优先级 1 就能匹配并 drop，连接根本建立不起来。这就是「端口拦截」能用、而「域名拦截」会被 `pass ip` 短路的根本区别：匹配条件需不需要等应用层数据。
+
+### 6、修复写法与逐包推演
+
+把优先级 100 改成不在 SYN 阶段匹配的写法，同时依赖策略默认动作放行握手包：
+
+```
+# 优先级 100 规则组（allow-rest）
+pass tcp any any -> any any (flow:established,to_server; sid:1000001; rev:1;)
+pass udp any any -> any any (sid:1000002; rev:1;)
+pass icmp any any -> any any (sid:1000003; rev:1;)
+
+# 策略默认动作
+aws:drop_established   # 放行三/四层握手包，丢弃已建立连接里没被任何 pass 命中的 client->server 数据包
+```
+
+再走一遍 `google.com`：
+
+#### (1) SYN 包
+
+- 优先级 1 / 2：不匹配
+- 优先级 100 `pass tcp ... flow:established,to_server`：连接还没 established → 不匹配
+- 没有规则命中 → 交给默认动作 `drop_established`：这是握手包 → 放行（连接得以建立）
+
+#### (2) HTTP GET 包（已 established、client→server、带 `Host: google.com`）
+
+- 优先级 1：不匹配
+- 优先级 2：`http.host = google.com` → **匹配！** → drop（google 被拦）
+- 优先级 100 的 pass 也能匹配这个包，但轮不到它，因为优先级 2 先命中
+
+换成访问 `aws.amazon.com`，同样这个数据包：优先级 2 不匹配（不是 google），优先级 100 `pass tcp` 匹配 → 放行。其他域名正常出网。
+
+**核心变化**：把 pass 从「SYN 包就能命中」挪到「应用层数据包才命中」。这样域名 drop（优先级 2）和兜底 pass（优先级 100）落在**同一个数据包**上比较，strict order 的优先级才真正起作用——小号的 drop 先生效；握手阶段的放行交给 `drop_established` 默认动作，而不是一条会「整流放行」的 `pass ip`。
+
+### 7、小结
+
+- strict order 的优先级，只在「多条规则都能匹配当前这个包」时才决定胜负。
+- 应用层规则（域名）只能在数据包阶段匹配，碰上一条在 SYN 阶段就 `pass` 的规则，会被「整条流放行」提前短路。
+- 解决办法：别让任何 `pass` 规则在 SYN 阶段命中（用 `flow:established,to_server` 限定），握手交给 `aws:drop_established`，让域名 drop 和兜底 pass 在同一个应用层数据包上按优先级公平较量。
+
+## 五、清理环境
 
 直接删除 CloudFormation Stack 即可。模板内置的 Lambda 自定义资源会在删除前自动清理指向 NFW Endpoint 的路由，避免「related VPC endpoint(s) still exist in route table(s)」导致防火墙删除失败。本方案新增的 IGW、NAT、NAT 子网、NAT 路由表均由 CFN 托管，会随 Stack 一并删除。
 
-## 五、参考文档
+## 六、参考文档
 
 [带有 Internet Gateway 和 NAT Gateway 的 NFW 架构](https://docs.aws.amazon.com/network-firewall/latest/developerguide/arch-igw-ngw.html)
 
