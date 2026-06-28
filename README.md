@@ -23,7 +23,7 @@
 | --- | --- |
 | Availability Zone | az |
 | Route Table | rt |
-| Private | pvr |
+| Private | prv |
 | Network Firewall | fw |
 
 ## 一、新增去往互联网的 NAT 时架构设计思路
@@ -37,7 +37,7 @@
 
 本方案的南北向流量中，云上 VPC 目前没有从互联网入站的流量（没有 ELB，EC2 也没有 EIP），因此 NFW 只检测 EC2 主动发起、去往互联网方向的出站流量。在此情况下，东西向和南北向的检测可共用一套 NFW ，也就是一个创建一个统一的 NFW Profile，在 NFW Rule Group 部分，分别填写东西向和南北向需要的扫描规则即可，这些规则因为有不同的源/目标 IP 地址，因此规则之间不会冲突。
 
-于此同时，因为检测的流量是从 VPC 去往互联网出站的，没有涉及到从互联网通过 ELB 入站的流量，因此每个 AZ 只需 1 个 NFW Endpoint 即可承载检测。当以后架构中增加了 ELB，并需要检测从互联网入站的陆良，那么处于要保留  source IP 的要求，在每个 AZ 内就需要 2 个 Endpoint 来分别处理入站与出站。
+于此同时，因为检测的流量是从 VPC 去往互联网出站的，没有涉及到从互联网通过 ELB 入站的流量，因此每个 AZ 只需 1 个 NFW Endpoint 即可承载检测。当以后架构中增加了 ELB，并需要检测从互联网入站的流量，那么出于要保留 source IP 的要求，在每个 AZ 内就需要 2 个 Endpoint 来分别处理入站与出站。
 
 ### 2、流量通过 NFW 和 NAT 的顺序问题
 
@@ -150,12 +150,12 @@ flowchart LR
 
 - 在目标区域已有一个 EC2 密钥对（`KeyPairName` 参数引用，用于 EC2 SSH，本方案登录主要用 SSM）
 - 账号默认 VPC、EIP 配额足够：本模板新建 2 个 VPC，新建 3 个 EIP，分别是 strongSwan 1 个 + NAT 2 个
-- 登陆 AWS 控制台的 IAM User 具备使用 CloudFormation 以及创建 VPC、NFW、NAT、IAM、Lambda、CloudWatch Logs 的权限
+- 登录 AWS 控制台的 IAM User 具备使用 CloudFormation 以及创建 VPC、NFW、NAT、IAM、Lambda、CloudWatch Logs 的权限
 
 ### 3、创建步骤
 
 - 1) 进入 CloudFormation 控制台，选择创建 Stack，上传模板 `vpc-dual-az-vgw-vpn-bgp-nfw-nat-create.yaml`
-- 2) 填写 Stack 名称，从本 AWS 账号现有的 EC2 密钥下拉框中，选择登陆 新创建 EC2 的 `KeyPairName`，其余参数可用默认值（其中 VPN 预共享密钥建议改为自定义密钥）
+- 2) 填写 Stack 名称，从本 AWS 账号现有的 EC2 密钥下拉框中，选择登录新创建 EC2 的 `KeyPairName`，其余参数可用默认值（其中 VPN 预共享密钥建议改为自定义密钥）
 - 3) 在权限确认页面勾选允许创建 IAM 资源，提交创建
 - 4) 等待约 20-30 分钟，Stack 状态变为 `CREATE_COMPLETE`
 
@@ -185,7 +185,7 @@ aws cloudformation create-stack \
 
 ### 1、登录 EC2 执行命令 
 
-云上业务 EC2 位于私有子网，通过 SSM Session Manager 登录（VPC 内已部署 SSM 接口终端节点，无须公网登陆）。
+云上业务 EC2 位于私有子网，通过 SSM Session Manager 登录（VPC 内已部署 SSM 接口终端节点，无须公网登录）。
 
 - 1) 进入 EC2 控制台，选择 `Workload AZ1 (inspection)` 或 `Workload AZ2 (inspection)`
 - 2) 点击 `Connect` → 选择 `Session Manager` 标签页 → 连接
@@ -239,7 +239,7 @@ curl -s --max-time 10 https://checkip.amazonaws.com
 - TCP keep-alives（保活探测）
 - TCP resets / RST（服务端主动断开）
 
-遇到这些数据包时，由于后续包含 7 层访问请求的规则尚未被触发，NFW 会判定当前数据包是没有匹配到任何一条 PASS 规则，因此就会按照没有匹配的行为丢弃这些服务器流控包，导致用户访问过程出现偶发卡住、偶发中断、长连接掉线等行为。此时日志中看不到记录，因为此时还没有进入完整的 Stateful 规则处理，拦截这些流控包的不是 Stateful 匹配的 7 层域名规则，而是防火墙默认行为。因此，使用 `Application drop established (server-directed only)` 这个规则，可以很好的适配 7 层 URL 规律场景。
+遇到这些数据包时，由于后续包含 7 层访问请求的规则尚未被触发，NFW 会判定当前数据包是没有匹配到任何一条 PASS 规则，因此就会按照没有匹配的行为丢弃这些服务器流控包，导致用户访问过程出现偶发卡住、偶发中断、长连接掉线等行为。此时日志中看不到记录，因为此时还没有进入完整的 Stateful 规则处理，拦截这些流控包的不是 Stateful 匹配的 7 层域名规则，而是防火墙默认行为。因此，使用 `Application drop established (server-directed only)` 这个规则，可以很好的适配 7 层 URL 规则场景。
 
 此外，选择 `Drop established` 也能满足放行服务器端发来的流控包的条件，但是在进行 7 层检测时候，如果遇到 SNI 和 Host 检测被触发之前服务器端发来的分段的 HTTP 请求，可能会被 NFW 丢弃。因此如果有 7 层检测规则，不建议使用 `Drop established`。
 
@@ -306,20 +306,20 @@ NFW 对于长连接的管理是需要特别注意，由于防火墙不可能维�
 而 Suricata 对 `pass` 的语义是：流中任一个包命中 `pass`，整条流后续包直接放行、不再过规则。如果优先级 100 写成 `pass ip any any`，那么针对被拦截域名的访问流量就会出现如下场景：
 
 - 客户端发来 SYN 包，优先级 1 的 4 层规则没匹配上，继续下一条规则
-- SYN 包只有 4 层信息是不含 7 层请求域名信息的，因此优先级为 2 的规则虽然想过滤域名，但现在检测不到，继续下一跳规则
+- SYN 包只有 4 层信息是不含 7 层请求域名信息的，因此优先级为 2 的规则虽然想过滤域名，但现在检测不到，继续下一条规则
 - 优先级 100 的兜底规则命中并触发**整流放行**
 
-由此可以看到，一但写了整体 pass 的规则，整个流都放行了，这个流后面的带 `Host` 的 HTTP GET 包根本进不了规则引擎，优先级为 2 的域名过滤黑名单规则的 drop 操作永远不会被匹配。
+由此可以看到，一旦写了整体 pass 的规则，整个流都放行了，这个流后面的带 `Host` 的 HTTP GET 包根本进不了规则引擎，优先级为 2 的域名过滤黑名单规则的 drop 操作永远不会被匹配。
 
 当给 pass 加上 `flow:established,to_server` 参数后，整体放行规则只发生在「连接已建立 + 客户端→服务器」的应用层数据包上才匹配，而不是从像刚才那样 SYN 开始就完全放行。此时域名 drop（优先级 2）和兜底 pass（优先级 100）是在同一个检查序列上，优先级小的先生效，由此触发了拦截才真正生效。
 
-注意：端口规则 `block-idc-http` 不受影响，因为这个规则是 4 层协议，和优先级 2 的 7 层协议不再一个纬度。因此无论放行规则的参数怎么写，4 层规则都有效。
+注意：端口规则 `block-idc-http` 不受影响，因为这个规则是 4 层协议，和优先级 2 的 7 层协议不在一个维度。因此无论放行规则的参数怎么写，4 层规则都有效。
 
 #### (3) 针对 7 层拦截规则、不含域名的 SYN 握手包 NFW 怎么处理
 
 上一个小节讲述到 SYN 规则不含 7 层信息，那么 SYN 是如何被 NFW 处理的呢？当一个 SYN 包没有匹配到任何 4 层规则的时候，NFW 使用策略默认 `aws:drop_established_app_layer_to_server` 来判断这个包是否放行。
 
-本章节的第一个小节探讨这个默认规则的设置。这个规则是应用层感知的，即先放行3层、4层握手和服务器返回方向，然后仅丢弃「已建立的连接中客户端→服务器方向」没有被规则 pass 放行的包，同时这个默认规则还对分段 TLS ClientHello / HTTP 请求做重组判定。因此选这个默认策略，即可在尚未收到 7 层请求的的 SNI、HTTP Host 信息之前，先放行这几个包，再根据整个流后续的包决定是否放行或拦截。由此就不会触发整个流被直接放行或者整个流被完全丢弃的场景了。
+本章节的第一个小节探讨这个默认规则的设置。这个规则是应用层感知的，即先放行3层、4层握手和服务器返回方向，然后仅丢弃「已建立的连接中客户端→服务器方向」没有被规则 pass 放行的包，同时这个默认规则还对分段 TLS ClientHello / HTTP 请求做重组判定。因此选这个默认策略，即可在尚未收到 7 层请求的 SNI、HTTP Host 信息之前，先放行这几个包，再根据整个流后续的包决定是否放行或拦截。由此就不会触发整个流被直接放行或者整个流被完全丢弃的场景了。
 
 以上几个章节是对 NFW 规则配置的一些详细探讨。
 
