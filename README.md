@@ -323,11 +323,206 @@ NFW 对于长连接的管理是需要特别注意，由于防火墙不可能维�
 
 以上几个章节是对 NFW 规则配置的一些详细探讨。
 
-## 五、清理环境
+## 五、关于 NFW Idle Timeout 闲置超时的补充说明
+
+在上一个章节，已经介绍了 NFW 闲置超时的设置修改。这里进行验证。
+
+首先将 NFW 的 Idle Timeout 从本 CloudFormation 默认的 1200+ 秒调整为 60 秒，便于快速实验。
+
+### 1、为 IDC 和 云上 VPC 之间的流量启用 NFW 
+
+这需要修改路由表，使得流量被引导通过 NFW 。修改方法可以参考之前的[这篇](https://blog.bitipcman.com/post/nfw-vgw-demo/)博客。
+
+### 2、模拟一个 SSH 访问并闲置 60 秒后触发 Idle Timeout 
+
+从代表云上 VPC 环境的 EC2 用 SSH 登录模拟 IDC 的 EC2。
+
+SSH 登录成功后，等待数秒后，查看 CloudWatch LogGroup 中 NFW 的 Flow 日志，可以看到 SSH 建立成功的记录。
+
+闲置 60 秒以上，可看到 SSH 卡死，按回车也没有反应。如果您等待足够长的时间，等客户端自己多次重试（自动地按照指数退避逐渐增大重试间隔），数分钟后才会收到 `client_loop: send disconnect: Broken pipe` 的报错信息。
+
+### 3、从 NFW 的 Flow 日志对 Idle Timeout 做行为分析
+
+进入 CloudWatch LogGroup 中 NFW 的 Flow 日志，观察可找到类似如下信息：
+
+```json
+{
+  "firewall_name": "nfw-test-os-keepalive-firewall",
+  "availability_zone": "ap-northeast-1a",
+  "event_timestamp": "1783175697",
+  "event": {
+    "tcp": {
+      "tcp_flags": "1a",
+      "syn": true,
+      "psh": true,
+      "ack": true
+    },
+    "app_proto": "ssh",
+    "src_ip": "10.87.114.52",
+    "src_port": 45096,
+    "netflow": {
+      "pkts": 154,
+      "bytes": 17367,
+      "start": "2026-07-04T14:33:51.321717+0000",
+      "end":   "2026-07-04T14:33:55.871232+0000",
+      "age": 4,
+      "min_ttl": 63,
+      "max_ttl": 63,
+      "state": "established",
+      "reason": "timeout",
+      "alerted": false,
+      "tx_cnt": 1
+    },
+    "event_type": "netflow",
+    "flow_id": 2226192497599167,
+    "dest_ip": "10.132.66.200",
+    "proto": "TCP",
+    "dest_port": 22,
+    "timestamp": "2026-07-04T14:34:57.468453+0000"
+  }
+}
+```
+
+关键字段的解读如下：
+
+| 字段 | 值 | 含义 |
+|---|---|---|
+| tcp.tcp_flags | "1a" (十六进制)	| "1a" = 0x02(SYN) + 0x08(PSH) + 0x10(ACK) = 26。RST 位是 0x04，没置位 |
+| tcp.rst	| 字段缺失 | 若曾出现 RST 应为 true。缺失=false |
+| netflow.reason | "timeout" | flow 关闭原因是 idle age-out。不是 "reset"，也不是 "stream_exception" |
+| netflow.state	| "established" | flow 关闭时的最终 TCP 状态。没有变成 "closed" |
+| netflow.alerted	| false	| Suricata 引擎规则：整条 flow 期间没有触发过任何 stateful rule alert |
+
+通过以上信息可以获得结论：
+
+- NFW 关闭长连接时候，直接从 `established` 状态关闭，不会进入 `Closed` 状态
+- NFW 处理 Idle Timeout，是直接回收连接资源，不属于异常流量 `stream_exception` 的包，因此不会触发 RST
+- NFW 管理连接时候，不会在 Alert 日志中记录，只在 Flow 日志中从长连接发起方向，记录到 `"reason": "timeout"` 的信息，反向不会记录 timeout 信息
+- 对已经被回收的长连接，后续两端如果继续发包，NFW 直接丢弃，不属于异常流量 `stream_exception` 的包，不会再补发 RST，同时 日志 Alert 中也不会记录
+
+### 4、如何从 NFW 的 Flow 日志中查找闲置超时 Idle timeout 的记录
+
+以上结论可以看出，查找长连接失效的办法，就是搜索 Flow 日志，查找关键字 `"reason": "timeout"` 的信息。
+
+#### (1) 使用 AWS CloudWatch 控制台上 Log Analytics 的方法
+
+进入 AWS 控制台，进入 CloudWatch 服务，在左侧菜单中，找到 `Log Analytics`，然后在右侧的 `Data sources` 检索框中选择 NFW 的 Log Groups 的名字，最后在查询框输入如下代码：
+
+```shell
+fields event.src_ip as src_ip,
+       event.src_port as src_port,
+       event.dest_ip as dst_ip,
+       event.dest_port as dst_port,
+       event.app_proto as app,
+       event.netflow.age as active_age,
+       event.netflow.pkts as pkts,
+       event.netflow.bytes as bytes,
+       event.netflow.start as flow_start,
+       event.netflow.end as flow_end,
+       event.timestamp as flow_gc_ts
+| filter event.netflow.reason = "timeout"
+     and event.proto = "TCP"
+     and event.netflow.state = "established"
+| parse flow_start /(?<sh>\d\d):(?<sm>\d\d):(?<ss>\d\d\.\d+)/
+| parse flow_end   /(?<eh>\d\d):(?<em>\d\d):(?<es>\d\d\.\d+)/
+| parse flow_gc_ts /(?<gh>\d\d):(?<gm>\d\d):(?<gs>\d\d\.\d+)/
+| fields (gh * 3600 + gm * 60 + gs) - (sh * 3600 + sm * 60 + ss) as total_life,
+         (gh * 3600 + gm * 60 + gs) - (eh * 3600 + em * 60 + es) as idle_duration
+| display total_life, active_age, idle_duration, pkts, bytes, app,
+          src_ip, src_port, dst_ip, dst_port, flow_start, flow_gc_ts
+| sort total_life desc
+| limit 20
+```
+
+查询结果如下截图。
+
+![](https://blogimg.bitipcman.com/workshop/nfw-with-nat/nfw-log-idle.png)
+
+由此就可以查询到近期发生闲置超时的长连接。
+
+#### (2) 使用 AWS CLI 脚本（要求本机有 AKSK 密钥）
+
+脚本有几个环境变量可以设置：
+
+- NFW_REGION
+- NFW_LOG_GROUP
+- NFW_WINDOW_HOURS
+- NFW_TOP_N
+
+这些环境变量可以在脚本开头修改，也可以在 shell 上以环境变量方式传入。保存后赋予脚本可执行权限。
+
+执行脚本：
+
+```shell
+./nfw-idle-report.sh
+```
+
+返回结果如下：
+
+```shell
+region:        ap-northeast-1
+log-group:     /aws/network-firewall/nfw-test-os-keepalive/flow
+window:        past 24h
+top-N:         20
+
+被 NFW idle timeout 静默切断的 TCP 长连接: 1 条
+
+====================================================================================================================================================
+Top 20 明细，按 total_life 排序 (连接从建立到被 NFW 闲置切断的持续时长):
+====================================================================================================================================================
+total_life active_age idle_duration   pkts    bytes     app  src                    -> dst                    start               evt_ts             
+     66.1s       4.0s         61.6s    154    17367     ssh  10.87.114.52:45096     -> 10.132.66.200:22       2026-07-04T14:33:51 2026-07-04T14:34:57
+
+字段说明:
+  total_life    = 连接总持续时长 (从 flow 建立、到处于活跃、到闲置下来被 NFW 切断, 即 active_age + idle_duration)
+  active_age    = 闲置下来之前，本 flow 的活跃期 (进入闲置前最后一个包的时间 - 第一个包的时间)
+  idle_duration = 最后一个包 到 NFW 切断的闲置时长 (≈ NFW 配置的 idle_duration 设置 + NFW 采样延迟)
+```
+
+由此即可找到日志中发生了 Idle Timeout 的长连接。
+
+### 5、为 OS 配置系统级 Keepalive 以维持长连接
+
+以上过程介绍了 NFW 在处理长连接闲置超时也就是 Idle Timeout 时候的规则，现在来验证增加 Keepalive 配置能否主动维持空闲的长连接，以确保不会被 NFW 判定为 Idle。
+
+通常而言，在如下几个地方会有关于 Keepalive 的配置，不同的软件启用方式不一样：
+
+- 客户端和服务器端操作系统层面（Linux 通常是 7200 秒）
+- 客户端软件（如本例的 SSH Client）
+- 服务器端软件（如本例的 SSH Server）
+
+这几处通常需要显式地加入 Keepalive 参数，才会让连接双方主动发送 Keepalive 包维持连接。
+
+以上文测试的 SSH 连接为例，客户端默认 `ServerAliveInterval = 0`，服务器端 `ClientAliveInterval = 0` 也是不发送 Keepalive，操作系统默认是 7200 秒。由于 NFW 默认最小 60 秒、最大 6000 秒，明显小于 Keepalive 包发送间隔，因此 NFW 就判定长连接为闲置，然后中断连接了。
+
+为了维持长连接不闲置，可修改客户端、服务器端软件的配置，还可以修改操作系统的配置。
+
+以修改操作系统配置为例，在客户端和服务器端两边的操作系统上，修改 `/etc/sysctl.conf`，加入如下配置：
+
+```shell
+net.ipv4.tcp_keepalive_time = 45
+net.ipv4.tcp_keepalive_intvl = 30
+```
+
+以上表示当连接空闲下来没有数据传输时候，等待 45 秒发送第一个 Keepalive 包，然后每隔 30 秒重复发送 Keepalive 包。注意：真实的操作系统环境一般不需要设置得这么小，因为上文为了更快获得长连接闲置效果，将 NFW 的闲置超时调整为了 60 秒，这是为了更快地完成测试。在正常环境中，确保这两个间隔都小于 NFW 配置的空闲超时即可。
+
+配置完毕后，重新加载系统参数，无须重启。
+
+```shell
+sudo sysctl -p
+```
+
+现在，重复之前章节的 SSH 登录并闲置试验，登录成功后什么都不要做，等待数个 60 秒后（确认 NFW 配置的闲置超时是 60 秒），再看 SSH 连接是否还在正常活跃，即可验证。
+
+### 6、小结
+
+以上章节介绍了如何通过 NFW 的 Flow 日志观察长连接的 Idle Timeout 闲置超时情况，并且验证了修改操作系统的 Keepalive 设置可维持长连接的有效性。
+
+## 六、清理环境
 
 在实验结束后，需要清除实验环境。进入 CloudFormation 服务，直接删除 CloudFormation Stack 即可。模板内置的 Lambda 自定义资源会在删除前自动清理指向 NFW Endpoint 的路由，可避免「related VPC endpoint(s) still exist in route table(s)」导致防火墙删除失败。
 
-## 六、参考文档
+## 七、参考文档
 
 [带有 Internet Gateway 和 NAT Gateway 的 NFW 架构](https://docs.aws.amazon.com/network-firewall/latest/developerguide/arch-igw-ngw.html)
 
